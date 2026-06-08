@@ -308,7 +308,7 @@ class SchedulerEngine:
 
                 if anomaly_items:
                     alert_triggered = True
-                    from app.alerts.aggregator import AlertAggregator, AggregatorConfig, AnomalyInput
+                    from app.alerts.aggregator import AlertAggregator, AggregatorConfig, AnomalyInput, SEVERITY_TO_FLOAT
                     aggregator = AlertAggregator(AggregatorConfig())
                     anomaly_inputs: list[AnomalyInput] = []
                     timestamps = [item.timestamp for item in anomaly_items]
@@ -338,7 +338,7 @@ class SchedulerEngine:
                             "root_metric": event.root_metric,
                             "related_metrics": str(event.related_metrics),
                             "start_time": event.start_time.isoformat(),
-                            "severity": float(event.severity.value == "critical"),
+                            "severity": SEVERITY_TO_FLOAT.get(event.severity, 0.0),
                             "suppressed": event.suppressed,
                             "channel": event.channel.value,
                         })

@@ -176,7 +176,7 @@ async def run_detection_task(
 
         alerts: list[dict] = []
         if all_anomalies:
-            from app.alerts.aggregator import AlertAggregator, AggregatorConfig, AnomalyInput
+            from app.alerts.aggregator import AlertAggregator, AggregatorConfig, AnomalyInput, SEVERITY_TO_FLOAT
 
             aggregator = AlertAggregator(AggregatorConfig())
             anomaly_inputs: list[AnomalyInput] = []
@@ -216,7 +216,7 @@ async def run_detection_task(
                     "root_metric": event.root_metric,
                     "related_metrics": str(event.related_metrics),
                     "start_time": event.start_time.isoformat(),
-                    "severity": float(event.severity.value == "critical"),
+                    "severity": SEVERITY_TO_FLOAT.get(event.severity, 0.0),
                     "suppressed": event.suppressed,
                     "channel": event.channel.value,
                 })

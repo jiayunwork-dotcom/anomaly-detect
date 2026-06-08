@@ -16,6 +16,14 @@ class Severity(str, Enum):
     CRITICAL = "critical"
 
 
+SEVERITY_TO_FLOAT: dict[Severity, float] = {
+    Severity.LOW: 0.5,
+    Severity.MEDIUM: 1.0,
+    Severity.HIGH: 2.0,
+    Severity.CRITICAL: 3.0,
+}
+
+
 class Channel(str, Enum):
     WEBHOOK = "webhook"
     CONSOLE = "console"
