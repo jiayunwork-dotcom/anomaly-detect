@@ -362,7 +362,7 @@ async def save_retrain_config(request: RetrainConfigRequest):
     if _retrain_engine is None:
         raise HTTPException(status_code=503, detail="Retrain engine not initialized")
     config = RetrainStrategyConfig(
-        model_id=request.model_id,
+        model_name=request.model_name,
         trigger_type=TriggerType(request.trigger_type),
         scheduled_interval_hours=request.scheduled_interval_hours,
         performance_window_size=request.performance_window_size,
@@ -375,11 +375,11 @@ async def save_retrain_config(request: RetrainConfigRequest):
     return RetrainConfigResponse(**config.model_dump())
 
 
-@app.get("/api/models/{model_id}/retrain-config", response_model=RetrainConfigResponse)
-async def get_retrain_config(model_id: str):
+@app.get("/api/models/{model_name}/retrain-config", response_model=RetrainConfigResponse)
+async def get_retrain_config(model_name: str):
     if _retrain_engine is None:
         raise HTTPException(status_code=503, detail="Retrain engine not initialized")
-    config = await _retrain_engine.get_retrain_config(model_id)
+    config = await _retrain_engine.get_retrain_config(model_name)
     if config is None:
         raise HTTPException(status_code=404, detail="Retrain config not found")
     return RetrainConfigResponse(**config.model_dump())

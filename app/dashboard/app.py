@@ -775,7 +775,7 @@ def render_tab_model_registry() -> None:
                 retrain_config: Optional[dict] = None
                 try:
                     rcresp = httpx.get(
-                        f"{API_BASE}/api/models/{active_id}/retrain-config",
+                        f"{API_BASE}/api/models/{name}/retrain-config",
                         timeout=10.0,
                     )
                     if rcresp.status_code == 200:
@@ -789,7 +789,7 @@ def render_tab_model_registry() -> None:
                     index=["scheduled", "performance", "data_drift"].index(
                         retrain_config.get("trigger_type", "scheduled") if retrain_config else "scheduled"
                     ),
-                    key=f"mr_trigger_{active_id}",
+                    key=f"mr_trigger_{name}",
                 )
                 rc_col1, rc_col2 = st.columns(2)
                 with rc_col1:
@@ -799,7 +799,7 @@ def render_tab_model_registry() -> None:
                             min_value=1,
                             max_value=720,
                             value=retrain_config.get("scheduled_interval_hours", 24) if retrain_config else 24,
-                            key=f"mr_interval_{active_id}",
+                            key=f"mr_interval_{name}",
                         )
                     else:
                         rc_interval = 24
@@ -810,7 +810,7 @@ def render_tab_model_registry() -> None:
                             min_value=1,
                             max_value=100,
                             value=retrain_config.get("performance_window_size", 10) if retrain_config else 10,
-                            key=f"mr_perf_window_{active_id}",
+                            key=f"mr_perf_window_{name}",
                         )
                         rc_f1_thresh = st.number_input(
                             "F1 Threshold",
@@ -818,7 +818,7 @@ def render_tab_model_registry() -> None:
                             max_value=1.0,
                             value=retrain_config.get("performance_f1_threshold", 0.7) if retrain_config else 0.7,
                             step=0.05,
-                            key=f"mr_f1_thresh_{active_id}",
+                            key=f"mr_f1_thresh_{name}",
                         )
                     else:
                         rc_window = 10
@@ -832,7 +832,7 @@ def render_tab_model_registry() -> None:
                             max_value=10.0,
                             value=retrain_config.get("drift_kl_threshold", 0.5) if retrain_config else 0.5,
                             step=0.05,
-                            key=f"mr_kl_thresh_{active_id}",
+                            key=f"mr_kl_thresh_{name}",
                         )
                     else:
                         rc_kl_thresh = 0.5
@@ -842,21 +842,21 @@ def render_tab_model_registry() -> None:
                         min_value=1,
                         max_value=365,
                         value=retrain_config.get("training_data_days", 30) if retrain_config else 30,
-                        key=f"mr_data_days_{active_id}",
+                        key=f"mr_data_days_{name}",
                     )
 
                 rc_enabled = st.checkbox(
                     "Enabled",
                     value=retrain_config.get("enabled", True) if retrain_config else True,
-                    key=f"mr_enabled_{active_id}",
+                    key=f"mr_enabled_{name}",
                 )
 
-                if st.button("Save Retrain Config", key=f"mr_save_config_{active_id}"):
+                if st.button("Save Retrain Config", key=f"mr_save_config_{name}"):
                     try:
                         save_resp = httpx.post(
                             f"{API_BASE}/api/models/retrain-config",
                             json={
-                                "model_id": active_id,
+                                "model_name": name,
                                 "trigger_type": rc_trigger,
                                 "scheduled_interval_hours": rc_interval,
                                 "performance_window_size": rc_window,

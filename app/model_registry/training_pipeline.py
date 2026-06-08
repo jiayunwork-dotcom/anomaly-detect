@@ -49,7 +49,7 @@ class TrainingPipeline:
     async def run_training(
         self,
         new_model_id: str,
-        parent_model_id: str,
+        parent_model_id: Optional[str] = None,
         training_data_days: int = 30,
         trigger_reason: str = "manual",
     ) -> TrainingContext:
@@ -59,19 +59,23 @@ class TrainingPipeline:
         self._progress_cache[new_model_id] = progress
 
         new_model = await self._registry.get_model(new_model_id)
-        parent_model = await self._registry.get_model(parent_model_id)
 
-        if new_model is None or parent_model is None:
+        if new_model is None:
             context.error = "Model not found"
             progress.stage = "failed"
             progress.error_message = context.error
             return context
 
-        old_metrics = {
-            "precision": parent_model.precision,
-            "recall": parent_model.recall,
-            "f1": parent_model.f1,
-        }
+        old_metrics = {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+        if parent_model_id is not None:
+            parent_model = await self._registry.get_model(parent_model_id)
+            if parent_model is not None:
+                old_metrics = {
+                    "precision": parent_model.precision,
+                    "recall": parent_model.recall,
+                    "f1": parent_model.f1,
+                }
+
         context.old_precision = old_metrics["precision"]
         context.old_recall = old_metrics["recall"]
         context.old_f1 = old_metrics["f1"]
@@ -177,7 +181,6 @@ class TrainingPipeline:
             context.new_f1 = f1
 
             await self._registry.update_model_metrics(new_model_id, precision, recall, f1)
-            await self._registry.update_model_status(new_model_id, ModelStatus.ACTIVE)
 
             context.stages.append({
                 "name": "evaluation",

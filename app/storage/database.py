@@ -184,15 +184,14 @@ CREATE TABLE IF NOT EXISTS model_versions (
 
 SCHEMA_RETRAIN_CONFIGS = """
 CREATE TABLE IF NOT EXISTS retrain_configs (
-    model_id TEXT PRIMARY KEY,
+    model_name TEXT PRIMARY KEY,
     trigger_type TEXT DEFAULT 'scheduled',
     scheduled_interval_hours INTEGER DEFAULT 24,
     performance_window_size INTEGER DEFAULT 10,
     performance_f1_threshold REAL DEFAULT 0.7,
     drift_kl_threshold REAL DEFAULT 0.5,
     training_data_days INTEGER DEFAULT 30,
-    enabled INTEGER DEFAULT 1,
-    FOREIGN KEY (model_id) REFERENCES model_versions(id)
+    enabled INTEGER DEFAULT 1
 )
 """
 
@@ -773,10 +772,13 @@ class StorageManager:
         await self._conn.commit()
 
     async def delete_model_version(self, model_id: str) -> None:
-        await self._conn.execute(
-            "DELETE FROM retrain_configs WHERE model_id = ?",
-            (model_id,),
-        )
+        model_row = await self.get_model_version(model_id)
+        model_name = model_row["name"] if model_row else None
+        if model_name:
+            await self._conn.execute(
+                "DELETE FROM retrain_configs WHERE model_name = ?",
+                (model_name,),
+            )
         await self._conn.execute(
             "DELETE FROM model_f1_history WHERE model_id = ?",
             (model_id,),
@@ -794,11 +796,11 @@ class StorageManager:
     async def save_retrain_config(self, config_dict: dict) -> None:
         await self._conn.execute(
             """INSERT OR REPLACE INTO retrain_configs
-               (model_id, trigger_type, scheduled_interval_hours, performance_window_size,
+               (model_name, trigger_type, scheduled_interval_hours, performance_window_size,
                 performance_f1_threshold, drift_kl_threshold, training_data_days, enabled)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                config_dict["model_id"],
+                config_dict["model_name"],
                 config_dict.get("trigger_type", "scheduled"),
                 config_dict.get("scheduled_interval_hours", 24),
                 config_dict.get("performance_window_size", 10),
@@ -810,18 +812,18 @@ class StorageManager:
         )
         await self._conn.commit()
 
-    async def get_retrain_config(self, model_id: str) -> Optional[dict]:
+    async def get_retrain_config(self, model_name: str) -> Optional[dict]:
         cursor = await self._conn.execute(
-            "SELECT model_id, trigger_type, scheduled_interval_hours, performance_window_size, "
+            "SELECT model_name, trigger_type, scheduled_interval_hours, performance_window_size, "
             "performance_f1_threshold, drift_kl_threshold, training_data_days, enabled "
-            "FROM retrain_configs WHERE model_id = ?",
-            (model_id,),
+            "FROM retrain_configs WHERE model_name = ?",
+            (model_name,),
         )
         row = await cursor.fetchone()
         if row is None:
             return None
         return {
-            "model_id": row[0], "trigger_type": row[1],
+            "model_name": row[0], "trigger_type": row[1],
             "scheduled_interval_hours": row[2],
             "performance_window_size": row[3],
             "performance_f1_threshold": row[4],
@@ -832,14 +834,14 @@ class StorageManager:
 
     async def list_retrain_configs(self) -> list[dict]:
         cursor = await self._conn.execute(
-            "SELECT model_id, trigger_type, scheduled_interval_hours, performance_window_size, "
+            "SELECT model_name, trigger_type, scheduled_interval_hours, performance_window_size, "
             "performance_f1_threshold, drift_kl_threshold, training_data_days, enabled "
             "FROM retrain_configs"
         )
         rows = await cursor.fetchall()
         return [
             {
-                "model_id": r[0], "trigger_type": r[1],
+                "model_name": r[0], "trigger_type": r[1],
                 "scheduled_interval_hours": r[2],
                 "performance_window_size": r[3],
                 "performance_f1_threshold": r[4],

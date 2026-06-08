@@ -68,8 +68,13 @@ class RetrainEngine:
             if not cfg_dict.get("enabled", True):
                 continue
             try:
+                model_name = cfg_dict["model_name"]
+                active_model = await self._registry.get_active_model(model_name)
+                if active_model is None:
+                    continue
+
                 config = RetrainStrategyConfig(
-                    model_id=cfg_dict["model_id"],
+                    model_name=model_name,
                     trigger_type=TriggerType(cfg_dict["trigger_type"]),
                     scheduled_interval_hours=cfg_dict.get("scheduled_interval_hours", 24),
                     performance_window_size=cfg_dict.get("performance_window_size", 10),
@@ -80,48 +85,45 @@ class RetrainEngine:
                 )
                 should_trigger = await self._should_trigger(config)
                 if should_trigger:
-                    await self.trigger_retrain(config.model_id, config.trigger_type.value)
+                    await self.trigger_retrain(active_model.id, config.trigger_type.value)
             except Exception as e:
-                logger.error("Strategy check error for %s: %s", cfg_dict.get("model_id"), e)
+                logger.error("Strategy check error for %s: %s", cfg_dict.get("model_name"), e)
 
     async def _should_trigger(self, config: RetrainStrategyConfig) -> bool:
-        model = await self._registry.get_model(config.model_id)
+        model = await self._registry.get_active_model(config.model_name)
         if model is None:
             return False
         if model.status != ModelStatus.ACTIVE:
             return False
-        if config.model_id in self._training_locks:
+        if model.id in self._training_locks:
             return False
 
         if config.trigger_type == TriggerType.SCHEDULED:
-            return await self._check_scheduled_trigger(config)
+            return await self._check_scheduled_trigger(config, model.id)
         elif config.trigger_type == TriggerType.PERFORMANCE:
-            return await self._check_performance_trigger(config)
+            return await self._check_performance_trigger(config, model.id)
         elif config.trigger_type == TriggerType.DATA_DRIFT:
-            return await self._check_drift_trigger(config)
+            return await self._check_drift_trigger(config, model)
         return False
 
-    async def _check_scheduled_trigger(self, config: RetrainStrategyConfig) -> bool:
-        last_training = await self._storage.get_last_training_time(config.model_id)
+    async def _check_scheduled_trigger(self, config: RetrainStrategyConfig, active_model_id: str) -> bool:
+        last_training = await self._storage.get_last_training_time(active_model_id)
         if last_training is None:
             return True
         last_dt = datetime.fromisoformat(last_training)
         threshold = timedelta(hours=config.scheduled_interval_hours)
         return datetime.utcnow() - last_dt >= threshold
 
-    async def _check_performance_trigger(self, config: RetrainStrategyConfig) -> bool:
+    async def _check_performance_trigger(self, config: RetrainStrategyConfig, active_model_id: str) -> bool:
         recent_f1s = await self._storage.get_recent_f1_scores(
-            config.model_id, config.performance_window_size
+            active_model_id, config.performance_window_size
         )
         if len(recent_f1s) < config.performance_window_size:
             return False
         avg_f1 = sum(recent_f1s) / len(recent_f1s)
         return avg_f1 < config.performance_f1_threshold
 
-    async def _check_drift_trigger(self, config: RetrainStrategyConfig) -> bool:
-        model = await self._registry.get_model(config.model_id)
-        if model is None:
-            return False
+    async def _check_drift_trigger(self, config: RetrainStrategyConfig, model: "ModelVersionInfo") -> bool:
         training_data_start = model.training_data_start
         training_data_end = model.training_data_end
         if not training_data_start or not training_data_end:
@@ -180,8 +182,43 @@ class RetrainEngine:
         self._training_locks.add(model_id)
 
         try:
-            retrain_config = await self._storage.get_retrain_config(model_id)
+            retrain_config = await self._storage.get_retrain_config(model.name)
             training_days = retrain_config.get("training_data_days", 30) if retrain_config else 30
+
+            if trigger_reason == "initial":
+                context = await self._pipeline.run_training(
+                    new_model_id=model_id,
+                    parent_model_id=None,
+                    training_data_days=training_days,
+                    trigger_reason=trigger_reason,
+                )
+
+                if context.error is not None:
+                    await self._registry.update_model_status(model_id, ModelStatus.FAILED)
+                    logger.error("Initial training failed for %s: %s", model_id, context.error)
+                else:
+                    await self._registry.activate_model(model_id)
+                    context.auto_activated = True
+                    logger.info("Initial training completed, activated model %s", model_id)
+
+                await self._storage.save_training_context(context.model_dump())
+
+                if self._ws_callback:
+                    try:
+                        await self._ws_callback({
+                            "type": "retrain_complete",
+                            "model_id": model_id,
+                            "model_name": model.name,
+                            "version": model.version,
+                            "auto_activated": context.auto_activated,
+                            "new_f1": context.new_f1,
+                            "old_f1": context.old_f1,
+                            "trigger_reason": trigger_reason,
+                        })
+                    except Exception:
+                        pass
+
+                return model_id
 
             new_model = await self._registry.register_model(
                 name=model.name,
@@ -246,7 +283,7 @@ class RetrainEngine:
 
     async def save_retrain_config(self, config: RetrainStrategyConfig) -> None:
         await self._storage.save_retrain_config({
-            "model_id": config.model_id,
+            "model_name": config.model_name,
             "trigger_type": config.trigger_type.value,
             "scheduled_interval_hours": config.scheduled_interval_hours,
             "performance_window_size": config.performance_window_size,
@@ -256,12 +293,12 @@ class RetrainEngine:
             "enabled": config.enabled,
         })
 
-    async def get_retrain_config(self, model_id: str) -> Optional[RetrainStrategyConfig]:
-        cfg = await self._storage.get_retrain_config(model_id)
+    async def get_retrain_config(self, model_name: str) -> Optional[RetrainStrategyConfig]:
+        cfg = await self._storage.get_retrain_config(model_name)
         if cfg is None:
             return None
         return RetrainStrategyConfig(
-            model_id=cfg["model_id"],
+            model_name=cfg["model_name"],
             trigger_type=TriggerType(cfg["trigger_type"]),
             scheduled_interval_hours=cfg.get("scheduled_interval_hours", 24),
             performance_window_size=cfg.get("performance_window_size", 10),

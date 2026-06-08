@@ -141,7 +141,7 @@ class ModelGroupResponse(BaseModel):
 
 
 class RetrainConfigRequest(BaseModel):
-    model_id: str
+    model_name: str
     trigger_type: str = "scheduled"
     scheduled_interval_hours: int = 24
     performance_window_size: int = 10
@@ -152,7 +152,7 @@ class RetrainConfigRequest(BaseModel):
 
 
 class RetrainConfigResponse(BaseModel):
-    model_id: str
+    model_name: str
     trigger_type: str = "scheduled"
     scheduled_interval_hours: int = 24
     performance_window_size: int = 10

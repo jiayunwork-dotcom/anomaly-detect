@@ -20,7 +20,7 @@ class TriggerType(str, Enum):
 
 
 class RetrainStrategyConfig(BaseModel):
-    model_id: str = ""
+    model_name: str = ""
     trigger_type: TriggerType = TriggerType.SCHEDULED
     scheduled_interval_hours: int = 24
     performance_window_size: int = 10
