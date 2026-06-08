@@ -89,9 +89,15 @@ class ABTestConfig(BaseModel):
     f1_improvement_threshold: float = 0.05
     status: ABTestStatus = ABTestStatus.RUNNING
     windows_completed: int = 0
+    primary_tp: int = 0
+    primary_fp: int = 0
+    primary_fn: int = 0
     primary_precision: float = 0.0
     primary_recall: float = 0.0
     primary_f1: float = 0.0
+    challenger_tp: int = 0
+    challenger_fp: int = 0
+    challenger_fn: int = 0
     challenger_precision: float = 0.0
     challenger_recall: float = 0.0
     challenger_f1: float = 0.0

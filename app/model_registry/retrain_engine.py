@@ -345,7 +345,7 @@ class RetrainEngine:
                 continue
 
             window_size = cfg_dict.get("performance_window_size", 10)
-            f1_threshold = cfg_dict.get("performance_f1_threshold", 0.7)
+            f1_threshold = float(cfg_dict.get("performance_f1_threshold", 0.7))
 
             recent_f1s = await self._storage.get_recent_f1_scores(
                 active_model.id, window_size
@@ -356,7 +356,7 @@ class RetrainEngine:
 
             consecutive_low = 0
             for f1_val in recent_f1s:
-                if f1_val < f1_threshold:
+                if float(f1_val) < f1_threshold:
                     consecutive_low += 1
                 else:
                     break

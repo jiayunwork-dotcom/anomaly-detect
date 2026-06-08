@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from app.ingestion.parser import parse_csv, parse_influxdb_lp, parse_prometheus_json
 from app.labeling.loop import LabelingLoop
 from app.model_registry import ModelRegistry, RetrainEngine, TrainingPipeline
-from app.model_registry.models import ModelStatus, RetrainStrategyConfig, TriggerType
+from app.model_registry.models import ABTestStatus, ModelStatus, RetrainStrategyConfig, TriggerType
 from app.scheduler.engine import SchedulerEngine
 from app.storage.database import StorageManager
 
@@ -443,7 +443,7 @@ async def stop_ab_test(model_name: str):
     ab_test = await _model_registry.get_ab_test(model_name)
     if ab_test is None:
         raise HTTPException(status_code=404, detail="A/B test not found")
-    if ab_test.status != "running":
+    if ab_test.status != ABTestStatus.RUNNING:
         raise HTTPException(status_code=400, detail="A/B test is not running")
     await storage.delete_ab_test(model_name)
     _model_registry._ab_test_cache.pop(model_name, None)

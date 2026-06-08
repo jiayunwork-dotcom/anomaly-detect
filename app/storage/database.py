@@ -236,9 +236,15 @@ CREATE TABLE IF NOT EXISTS ab_tests (
     f1_improvement_threshold REAL DEFAULT 0.05,
     status TEXT DEFAULT 'running',
     windows_completed INTEGER DEFAULT 0,
+    primary_tp INTEGER DEFAULT 0,
+    primary_fp INTEGER DEFAULT 0,
+    primary_fn INTEGER DEFAULT 0,
     primary_precision REAL DEFAULT 0.0,
     primary_recall REAL DEFAULT 0.0,
     primary_f1 REAL DEFAULT 0.0,
+    challenger_tp INTEGER DEFAULT 0,
+    challenger_fp INTEGER DEFAULT 0,
+    challenger_fn INTEGER DEFAULT 0,
     challenger_precision REAL DEFAULT 0.0,
     challenger_recall REAL DEFAULT 0.0,
     challenger_f1 REAL DEFAULT 0.0,
@@ -287,6 +293,11 @@ class StorageManager:
         await self._conn.execute(SCHEMA_MODEL_F1_HISTORY)
         await self._conn.execute(SCHEMA_AB_TESTS)
         await self._conn.execute(SCHEMA_MODEL_ALERTS)
+        for col in ("primary_tp", "primary_fp", "primary_fn", "challenger_tp", "challenger_fp", "challenger_fn"):
+            try:
+                await self._conn.execute(f"ALTER TABLE ab_tests ADD COLUMN {col} INTEGER DEFAULT 0")
+            except Exception:
+                pass
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -974,10 +985,12 @@ class StorageManager:
             """INSERT OR REPLACE INTO ab_tests
                (model_name, primary_model_id, challenger_model_id, primary_traffic_pct,
                 min_windows, f1_improvement_threshold, status, windows_completed,
+                primary_tp, primary_fp, primary_fn,
                 primary_precision, primary_recall, primary_f1,
+                challenger_tp, challenger_fp, challenger_fn,
                 challenger_precision, challenger_recall, challenger_f1,
                 created_at, updated_at, ended_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 test_dict["model_name"],
                 test_dict["primary_model_id"],
@@ -987,9 +1000,15 @@ class StorageManager:
                 test_dict.get("f1_improvement_threshold", 0.05),
                 test_dict.get("status", "running"),
                 test_dict.get("windows_completed", 0),
+                test_dict.get("primary_tp", 0),
+                test_dict.get("primary_fp", 0),
+                test_dict.get("primary_fn", 0),
                 test_dict.get("primary_precision", 0.0),
                 test_dict.get("primary_recall", 0.0),
                 test_dict.get("primary_f1", 0.0),
+                test_dict.get("challenger_tp", 0),
+                test_dict.get("challenger_fp", 0),
+                test_dict.get("challenger_fn", 0),
                 test_dict.get("challenger_precision", 0.0),
                 test_dict.get("challenger_recall", 0.0),
                 test_dict.get("challenger_f1", 0.0),
@@ -1004,7 +1023,9 @@ class StorageManager:
         cursor = await self._conn.execute(
             "SELECT model_name, primary_model_id, challenger_model_id, primary_traffic_pct, "
             "min_windows, f1_improvement_threshold, status, windows_completed, "
+            "primary_tp, primary_fp, primary_fn, "
             "primary_precision, primary_recall, primary_f1, "
+            "challenger_tp, challenger_fp, challenger_fn, "
             "challenger_precision, challenger_recall, challenger_f1, "
             "created_at, updated_at, ended_at FROM ab_tests WHERE model_name = ?",
             (model_name,),
@@ -1016,16 +1037,20 @@ class StorageManager:
             "model_name": row[0], "primary_model_id": row[1], "challenger_model_id": row[2],
             "primary_traffic_pct": row[3], "min_windows": row[4], "f1_improvement_threshold": row[5],
             "status": row[6], "windows_completed": row[7],
-            "primary_precision": row[8], "primary_recall": row[9], "primary_f1": row[10],
-            "challenger_precision": row[11], "challenger_recall": row[12], "challenger_f1": row[13],
-            "created_at": row[14], "updated_at": row[15], "ended_at": row[16],
+            "primary_tp": row[8], "primary_fp": row[9], "primary_fn": row[10],
+            "primary_precision": row[11], "primary_recall": row[12], "primary_f1": row[13],
+            "challenger_tp": row[14], "challenger_fp": row[15], "challenger_fn": row[16],
+            "challenger_precision": row[17], "challenger_recall": row[18], "challenger_f1": row[19],
+            "created_at": row[20], "updated_at": row[21], "ended_at": row[22],
         }
 
     async def list_ab_tests(self) -> list[dict]:
         cursor = await self._conn.execute(
             "SELECT model_name, primary_model_id, challenger_model_id, primary_traffic_pct, "
             "min_windows, f1_improvement_threshold, status, windows_completed, "
+            "primary_tp, primary_fp, primary_fn, "
             "primary_precision, primary_recall, primary_f1, "
+            "challenger_tp, challenger_fp, challenger_fn, "
             "challenger_precision, challenger_recall, challenger_f1, "
             "created_at, updated_at, ended_at FROM ab_tests ORDER BY created_at DESC"
         )
@@ -1035,9 +1060,11 @@ class StorageManager:
                 "model_name": r[0], "primary_model_id": r[1], "challenger_model_id": r[2],
                 "primary_traffic_pct": r[3], "min_windows": r[4], "f1_improvement_threshold": r[5],
                 "status": r[6], "windows_completed": r[7],
-                "primary_precision": r[8], "primary_recall": r[9], "primary_f1": r[10],
-                "challenger_precision": r[11], "challenger_recall": r[12], "challenger_f1": r[13],
-                "created_at": r[14], "updated_at": r[15], "ended_at": r[16],
+                "primary_tp": r[8], "primary_fp": r[9], "primary_fn": r[10],
+                "primary_precision": r[11], "primary_recall": r[12], "primary_f1": r[13],
+                "challenger_tp": r[14], "challenger_fp": r[15], "challenger_fn": r[16],
+                "challenger_precision": r[17], "challenger_recall": r[18], "challenger_f1": r[19],
+                "created_at": r[20], "updated_at": r[21], "ended_at": r[22],
             }
             for r in rows
         ]

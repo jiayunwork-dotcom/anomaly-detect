@@ -235,12 +235,18 @@ class ModelRegistry:
             f1_improvement_threshold=f1_improvement_threshold,
             status=ABTestStatus.RUNNING,
             windows_completed=0,
-            primary_precision=primary.precision,
-            primary_recall=primary.recall,
-            primary_f1=primary.f1,
-            challenger_precision=challenger.precision,
-            challenger_recall=challenger.recall,
-            challenger_f1=challenger.f1,
+            primary_tp=0,
+            primary_fp=0,
+            primary_fn=0,
+            primary_precision=0.0,
+            primary_recall=0.0,
+            primary_f1=0.0,
+            challenger_tp=0,
+            challenger_fp=0,
+            challenger_fn=0,
+            challenger_precision=0.0,
+            challenger_recall=0.0,
+            challenger_f1=0.0,
             created_at=now,
             updated_at=now,
         )
@@ -259,7 +265,16 @@ class ModelRegistry:
         row = await self._storage.get_ab_test(model_name)
         if row is None:
             return None
-        config = ABTestConfig(
+        config = self._row_to_ab_test(row)
+        self._ab_test_cache[model_name] = config
+        return config
+
+    async def list_ab_tests(self) -> list[ABTestConfig]:
+        rows = await self._storage.list_ab_tests()
+        return [self._row_to_ab_test(row) for row in rows]
+
+    def _row_to_ab_test(self, row: dict) -> ABTestConfig:
+        return ABTestConfig(
             model_name=row["model_name"],
             primary_model_id=row["primary_model_id"],
             challenger_model_id=row["challenger_model_id"],
@@ -268,9 +283,15 @@ class ModelRegistry:
             f1_improvement_threshold=row["f1_improvement_threshold"],
             status=ABTestStatus(row["status"]),
             windows_completed=row["windows_completed"],
+            primary_tp=row.get("primary_tp", 0),
+            primary_fp=row.get("primary_fp", 0),
+            primary_fn=row.get("primary_fn", 0),
             primary_precision=row["primary_precision"],
             primary_recall=row["primary_recall"],
             primary_f1=row["primary_f1"],
+            challenger_tp=row.get("challenger_tp", 0),
+            challenger_fp=row.get("challenger_fp", 0),
+            challenger_fn=row.get("challenger_fn", 0),
             challenger_precision=row["challenger_precision"],
             challenger_recall=row["challenger_recall"],
             challenger_f1=row["challenger_f1"],
@@ -278,34 +299,6 @@ class ModelRegistry:
             updated_at=row["updated_at"],
             ended_at=row["ended_at"],
         )
-        self._ab_test_cache[model_name] = config
-        return config
-
-    async def list_ab_tests(self) -> list[ABTestConfig]:
-        rows = await self._storage.list_ab_tests()
-        results = []
-        for row in rows:
-            config = ABTestConfig(
-                model_name=row["model_name"],
-                primary_model_id=row["primary_model_id"],
-                challenger_model_id=row["challenger_model_id"],
-                primary_traffic_pct=row["primary_traffic_pct"],
-                min_windows=row["min_windows"],
-                f1_improvement_threshold=row["f1_improvement_threshold"],
-                status=ABTestStatus(row["status"]),
-                windows_completed=row["windows_completed"],
-                primary_precision=row["primary_precision"],
-                primary_recall=row["primary_recall"],
-                primary_f1=row["primary_f1"],
-                challenger_precision=row["challenger_precision"],
-                challenger_recall=row["challenger_recall"],
-                challenger_f1=row["challenger_f1"],
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
-                ended_at=row["ended_at"],
-            )
-            results.append(config)
-        return results
 
     async def route_ab_test(self, model_name: str) -> Optional[str]:
         ab_test = await self.get_ab_test(model_name)
@@ -322,12 +315,10 @@ class ModelRegistry:
     async def record_ab_test_window(
         self,
         model_name: str,
-        primary_precision: float,
-        primary_recall: float,
-        primary_f1: float,
-        challenger_precision: float,
-        challenger_recall: float,
-        challenger_f1: float,
+        is_primary: bool,
+        tp: int,
+        fp: int,
+        fn: int,
         ws_callback=None,
     ) -> Optional[ABTestConfig]:
         ab_test = await self.get_ab_test(model_name)
@@ -335,12 +326,34 @@ class ModelRegistry:
             return None
 
         ab_test.windows_completed += 1
-        ab_test.primary_precision = primary_precision
-        ab_test.primary_recall = primary_recall
-        ab_test.primary_f1 = primary_f1
-        ab_test.challenger_precision = challenger_precision
-        ab_test.challenger_recall = challenger_recall
-        ab_test.challenger_f1 = challenger_f1
+
+        if is_primary:
+            ab_test.primary_tp += tp
+            ab_test.primary_fp += fp
+            ab_test.primary_fn += fn
+            total_tp = ab_test.primary_tp
+            total_fp = ab_test.primary_fp
+            total_fn = ab_test.primary_fn
+            ab_test.primary_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+            ab_test.primary_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+            ab_test.primary_f1 = (
+                2 * ab_test.primary_precision * ab_test.primary_recall / (ab_test.primary_precision + ab_test.primary_recall)
+                if (ab_test.primary_precision + ab_test.primary_recall) > 0 else 0.0
+            )
+        else:
+            ab_test.challenger_tp += tp
+            ab_test.challenger_fp += fp
+            ab_test.challenger_fn += fn
+            total_tp = ab_test.challenger_tp
+            total_fp = ab_test.challenger_fp
+            total_fn = ab_test.challenger_fn
+            ab_test.challenger_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+            ab_test.challenger_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+            ab_test.challenger_f1 = (
+                2 * ab_test.challenger_precision * ab_test.challenger_recall / (ab_test.challenger_precision + ab_test.challenger_recall)
+                if (ab_test.challenger_precision + ab_test.challenger_recall) > 0 else 0.0
+            )
+
         now = datetime.utcnow().isoformat()
         ab_test.updated_at = now
 

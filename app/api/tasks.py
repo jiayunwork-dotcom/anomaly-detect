@@ -84,14 +84,18 @@ def _run_detection_for_metric(
     series: pd.Series,
     metric_name: str,
     request: DetectionRequest,
+    override_params: dict | None = None,
 ) -> list[AnomalyItem]:
     detectors = _get_detectors(request.algorithms, metric_name, request.metric_configs)
     if not detectors:
         return []
 
-    algo_config = request.algorithm_configs.get(metric_name, {})
-    metric_config = request.metric_configs.get(metric_name, {})
-    merged_config = {**algo_config, **metric_config.get("params", {})}
+    if override_params is not None:
+        merged_config = dict(override_params)
+    else:
+        algo_config = request.algorithm_configs.get(metric_name, {})
+        metric_config = request.metric_configs.get(metric_name, {})
+        merged_config = {**algo_config, **metric_config.get("params", {})}
 
     if len(detectors) > 1:
         ensemble = EnsembleDetector(detectors, weights=request.weights)
@@ -135,7 +139,7 @@ async def run_detection_task(
         all_anomalies: list[AnomalyItem] = []
         anomaly_metrics: list[str] = []
 
-        ab_routing_decisions: dict[str, str] = {}
+        ab_routing_decisions: dict[str, tuple[str, dict]] = {}
         if model_registry is not None:
             from app.model_registry.models import ABTestStatus
 
@@ -145,7 +149,9 @@ async def run_detection_task(
                     if routed_model_id is not None:
                         ab_test = await model_registry.get_ab_test(algo_name)
                         if ab_test is not None and ab_test.status == ABTestStatus.RUNNING:
-                            ab_routing_decisions[algo_name] = routed_model_id
+                            routed_model = await model_registry.get_model(routed_model_id)
+                            training_params = routed_model.training_params if routed_model else None
+                            ab_routing_decisions[algo_name] = (routed_model_id, training_params)
                 except Exception:
                     pass
 
@@ -157,8 +163,15 @@ async def run_detection_task(
                 series = shard_df[col_name].dropna()
                 if series.empty:
                     continue
+
+                override_params = None
+                for algo_name, (_, params) in ab_routing_decisions.items():
+                    if params is not None:
+                        override_params = params
+                        break
+
                 items = await asyncio.to_thread(
-                    _run_detection_for_metric, series, col_name, request
+                    _run_detection_for_metric, series, col_name, request, override_params
                 )
                 anomalous_items = [item for item in items if item.is_anomaly]
                 all_anomalies.extend(anomalous_items)
@@ -261,13 +274,12 @@ async def run_detection_task(
         if model_registry is not None and ab_routing_decisions:
             from app.model_registry.models import ABTestStatus
 
-            for algo_name, routed_model_id in ab_routing_decisions.items():
+            for algo_name, (routed_model_id, _) in ab_routing_decisions.items():
                 try:
                     ab_test = await model_registry.get_ab_test(algo_name)
                     if ab_test is None or ab_test.status != ABTestStatus.RUNNING:
                         continue
 
-                    tp = fp = fn = tn = 0
                     algo_items = [a for a in all_anomalies if a.algorithm == algo_name]
                     algo_anomalous = [a for a in algo_items if a.is_anomaly]
 
@@ -290,35 +302,52 @@ async def run_detection_task(
                     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
                     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
-                    is_primary = routed_model_id == ab_test.primary_model_id
+                    await storage.save_f1_score(routed_model_id, f1)
 
-                    if is_primary:
-                        cur_primary_p = precision
-                        cur_primary_r = recall
-                        cur_primary_f1 = f1
-                        cur_challenger_p = ab_test.challenger_precision
-                        cur_challenger_r = ab_test.challenger_recall
-                        cur_challenger_f1 = ab_test.challenger_f1
-                    else:
-                        cur_primary_p = ab_test.primary_precision
-                        cur_primary_r = ab_test.primary_recall
-                        cur_primary_f1 = ab_test.primary_f1
-                        cur_challenger_p = precision
-                        cur_challenger_r = recall
-                        cur_challenger_f1 = f1
+                    is_primary = routed_model_id == ab_test.primary_model_id
 
                     await model_registry.record_ab_test_window(
                         model_name=algo_name,
-                        primary_precision=cur_primary_p,
-                        primary_recall=cur_primary_r,
-                        primary_f1=cur_primary_f1,
-                        challenger_precision=cur_challenger_p,
-                        challenger_recall=cur_challenger_r,
-                        challenger_f1=cur_challenger_f1,
+                        is_primary=is_primary,
+                        tp=tp,
+                        fp=fp,
+                        fn=fn,
                         ws_callback=ws_callback,
                     )
                 except Exception:
                     pass
+        elif model_registry is not None:
+            try:
+                for algo_name in (request.algorithms or list(DETECTOR_MAP.keys())):
+                    active_model = await model_registry.get_active_model(algo_name)
+                    if active_model is None:
+                        continue
+
+                    algo_items = [a for a in all_anomalies if a.algorithm == algo_name]
+                    algo_anomalous = [a for a in algo_items if a.is_anomaly]
+
+                    labeled_events = await storage.get_anomaly_events(
+                        datetime.utcnow() - timedelta(hours=1),
+                        datetime.utcnow(),
+                    )
+                    ground_truth_timestamps = set()
+                    for evt in labeled_events:
+                        if evt.get("algorithm") == algo_name and evt.get("label") == "tp":
+                            ground_truth_timestamps.add(evt.get("start_time", ""))
+
+                    detected_timestamps = set(a.timestamp for a in algo_anomalous)
+
+                    tp = len(detected_timestamps & ground_truth_timestamps)
+                    fp = len(detected_timestamps - ground_truth_timestamps)
+                    fn = len(ground_truth_timestamps - detected_timestamps)
+
+                    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+                    await storage.save_f1_score(active_model.id, f1)
+            except Exception:
+                pass
 
         result = DetectionResult(
             task_id=task_id,
