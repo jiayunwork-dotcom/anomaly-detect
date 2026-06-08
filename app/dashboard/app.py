@@ -27,6 +27,7 @@ from app.detection.ml import IsolationForestDetector, LSTMEncoderDetector, Proph
 from app.detection.statistical import IQRFecutor, STLDetector, ThreeSigmaDetector
 from app.ingestion.parser import parse_csv, parse_influxdb_lp, parse_prometheus_json
 from app.labeling.loop import LabelingLoop
+from app.scheduler.models import ScheduleCreateRequest, ScheduleInterval
 from app.storage.database import StorageManager
 
 from app.dashboard.components import (
@@ -228,6 +229,79 @@ def render_sidebar() -> tuple[list[str], datetime, datetime, list[str], list[str
         st.header("Data Import")
         st.file_uploader("Upload File", type=["csv", "json", "txt"], key="sidebar_upload")
         st.selectbox("Format", ["CSV", "Prometheus JSON", "InfluxDB LP"], key="sidebar_format")
+
+        st.header("Schedule")
+        sched_name = st.text_input("Task Name", value="Untitled Schedule", key="sched_name")
+        interval_options = {
+            "1 minute": ScheduleInterval.MIN_1,
+            "5 minutes": ScheduleInterval.MIN_5,
+            "15 minutes": ScheduleInterval.MIN_15,
+            "30 minutes": ScheduleInterval.MIN_30,
+            "1 hour": ScheduleInterval.HOUR_1,
+            "Custom Cron": ScheduleInterval.CUSTOM,
+        }
+        sched_interval_label = st.selectbox(
+            "Interval", list(interval_options.keys()), key="sched_interval"
+        )
+        sched_interval = interval_options[sched_interval_label]
+        cron_expr = None
+        if sched_interval == ScheduleInterval.CUSTOM:
+            cron_expr = st.text_input(
+                "Cron Expression (min hour day month day_of_week)",
+                value="*/5 * * * *",
+                key="sched_cron",
+            )
+
+        available_metrics = filtered if filtered else metric_names
+        sched_metrics = st.multiselect(
+            "Metrics to Monitor", available_metrics, key="sched_metrics"
+        )
+        sched_algorithms = st.multiselect(
+            "Algorithms",
+            list(ALGORITHM_REGISTRY.keys()),
+            default=["three_sigma", "iqr"],
+            key="sched_algorithms",
+        )
+        sched_ensemble = st.radio(
+            "Voting Mode", ["majority", "weighted"],
+            horizontal=True, key="sched_ensemble"
+        )
+        sched_weights: dict[str, float] = {}
+        if sched_ensemble == "weighted":
+            for algo_name in sched_algorithms:
+                w = st.slider(
+                    algo_name, min_value=0.0, max_value=2.0,
+                    value=1.0, step=0.1, key=f"sched_weight_{algo_name}",
+                )
+                sched_weights[algo_name] = w
+
+        if st.button("Save Schedule", key="save_schedule_btn"):
+            if not sched_metrics:
+                st.warning("Select at least one metric to monitor.")
+            elif not sched_algorithms:
+                st.warning("Select at least one algorithm.")
+            else:
+                import httpx
+                try:
+                    resp = httpx.post(
+                        "http://localhost:8000/api/schedules",
+                        json={
+                            "name": sched_name,
+                            "interval": sched_interval.value,
+                            "cron_expression": cron_expr,
+                            "metrics": sched_metrics,
+                            "algorithms": sched_algorithms,
+                            "ensemble_mode": sched_ensemble,
+                            "weights": sched_weights,
+                        },
+                        timeout=10.0,
+                    )
+                    if resp.status_code == 200:
+                        st.success(f"Schedule created: {resp.json().get('id', '')}")
+                    else:
+                        st.error(f"Failed: {resp.text}")
+                except Exception as e:
+                    st.error(f"API error: {e}")
 
     return selected_metrics, start_time, end_time, selected_algorithms, selected_granularities, ensemble_mode, weights
 
@@ -443,6 +517,144 @@ def render_tab_import(storage: StorageManager) -> None:
         st.rerun()
 
 
+def render_tab_scheduled_tasks() -> None:
+    import httpx
+
+    st.header("Scheduled Tasks")
+    schedules: list[dict] = []
+    try:
+        resp = httpx.get("http://localhost:8000/api/schedules", timeout=10.0)
+        if resp.status_code == 200:
+            schedules = resp.json()
+    except Exception as e:
+        st.error(f"Failed to load schedules: {e}")
+        return
+
+    if not schedules:
+        st.info("No scheduled tasks found. Create one from the sidebar Schedule section.")
+        return
+
+    status_icons = {
+        "running": "🟢 Running",
+        "paused": "🟡 Paused",
+        "failed": "🔴 Failed",
+    }
+    interval_labels = {
+        "1m": "1 min", "5m": "5 min", "15m": "15 min",
+        "30m": "30 min", "1h": "1 hour", "custom": "Custom",
+    }
+
+    for sched in schedules:
+        sched_id = sched.get("id", "")
+        status = sched.get("status", "running")
+        status_label = status_icons.get(status, status)
+        interval = sched.get("interval", "")
+        interval_label = interval_labels.get(interval, interval)
+
+        with st.expander(
+            f"{sched.get('name', 'Untitled')} — {status_label} — {interval_label}",
+            expanded=False,
+        ):
+            col1, col2, col3, col4 = st.columns([2, 2, 2, 1])
+            col1.metric("Status", status_label)
+            col2.metric("Next Run", sched.get("next_run_time", "N/A"))
+            last_result = f"{sched.get('last_anomaly_count', 0)} anomalies"
+            if sched.get("last_alert_triggered"):
+                last_result += " (alert fired)"
+            col3.metric("Last Result", last_result)
+            col4.metric("Last Run", sched.get("last_run_time", "Never"))
+
+            st.caption(
+                f"Metrics: {', '.join(sched.get('metrics', []))} | "
+                f"Algorithms: {', '.join(sched.get('algorithms', []))} | "
+                f"Voting: {sched.get('ensemble_mode', 'majority')}"
+            )
+            if sched.get("cron_expression"):
+                st.caption(f"Cron: {sched['cron_expression']}")
+
+            btn_col1, btn_col2, btn_col3 = st.columns(3)
+            if status == "running":
+                if btn_col1.button("Pause", key=f"pause_{sched_id}"):
+                    try:
+                        r = httpx.put(
+                            f"http://localhost:8000/api/schedules/{sched_id}/pause",
+                            timeout=10.0,
+                        )
+                        if r.status_code == 200:
+                            st.success("Paused")
+                            st.rerun()
+                        else:
+                            st.error(r.text)
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+            elif status == "paused":
+                if btn_col1.button("Resume", key=f"resume_{sched_id}"):
+                    try:
+                        r = httpx.put(
+                            f"http://localhost:8000/api/schedules/{sched_id}/resume",
+                            timeout=10.0,
+                        )
+                        if r.status_code == 200:
+                            st.success("Resumed")
+                            st.rerun()
+                        else:
+                            st.error(r.text)
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+
+            if btn_col3.button("Delete", key=f"delete_{sched_id}"):
+                try:
+                    r = httpx.delete(
+                        f"http://localhost:8000/api/schedules/{sched_id}",
+                        timeout=10.0,
+                    )
+                    if r.status_code == 200:
+                        st.success("Deleted")
+                        st.rerun()
+                    else:
+                        st.error(r.text)
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+            st.subheader("Execution History (Last 20)")
+            try:
+                hist_resp = httpx.get(
+                    f"http://localhost:8000/api/schedules/{sched_id}/history",
+                    timeout=10.0,
+                )
+                if hist_resp.status_code == 200:
+                    history = hist_resp.json()
+                    if history:
+                        hist_rows = []
+                        for h in history:
+                            hist_status = h.get("status", "")
+                            if hist_status == "completed":
+                                status_icon = "✅"
+                            elif hist_status == "failed":
+                                status_icon = "❌"
+                            else:
+                                status_icon = "⏳"
+                            hist_rows.append({
+                                "Start": h.get("start_time", ""),
+                                "End": h.get("end_time", "—"),
+                                "Status": f"{status_icon} {hist_status}",
+                                "Anomalies": h.get("anomaly_count", 0),
+                                "Alert": "Yes" if h.get("alert_triggered") else "No",
+                                "Error": (h.get("error", "") or "")[:80],
+                            })
+                        st.dataframe(
+                            pd.DataFrame(hist_rows),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.info("No execution history yet.")
+                else:
+                    st.warning("Failed to load history.")
+            except Exception as e:
+                st.warning(f"History load error: {e}")
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Anomaly Detection Dashboard",
@@ -467,9 +679,9 @@ def main() -> None:
                 ensemble_mode, weights,
             )
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         ["Time Series", "Anomaly Events", "Root Cause Analysis",
-         "Algorithm Performance", "Data Import"]
+         "Algorithm Performance", "Data Import", "Scheduled Tasks"]
     )
 
     with tab1:
@@ -486,6 +698,9 @@ def main() -> None:
 
     with tab5:
         render_tab_import(storage)
+
+    with tab6:
+        render_tab_scheduled_tasks()
 
 
 if __name__ == "__main__":

@@ -131,6 +131,38 @@ CREATE TABLE IF NOT EXISTS algorithm_performance (
 )
 """
 
+SCHEMA_SCHEDULES = """
+CREATE TABLE IF NOT EXISTS schedules (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT 'Untitled',
+    interval TEXT NOT NULL DEFAULT '5m',
+    cron_expression TEXT,
+    metrics TEXT DEFAULT '[]',
+    algorithms TEXT DEFAULT '["three_sigma","iqr"]',
+    ensemble_mode TEXT DEFAULT 'majority',
+    weights TEXT DEFAULT '{}',
+    status TEXT DEFAULT 'running',
+    last_run_time TEXT,
+    last_anomaly_count INTEGER DEFAULT 0,
+    last_alert_triggered INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL
+)
+"""
+
+SCHEMA_EXECUTION_HISTORY = """
+CREATE TABLE IF NOT EXISTS execution_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    schedule_id TEXT NOT NULL,
+    start_time TEXT NOT NULL,
+    end_time TEXT,
+    anomaly_count INTEGER DEFAULT 0,
+    alert_triggered INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'running',
+    error TEXT,
+    FOREIGN KEY (schedule_id) REFERENCES schedules(id)
+)
+"""
+
 
 class StorageManager:
     def __init__(self, db_path: str = "metadata.db", data_dir: str = "data") -> None:
@@ -147,6 +179,8 @@ class StorageManager:
         await self._conn.execute(SCHEMA_ALERT_EVENTS)
         await self._conn.execute(SCHEMA_PATTERN_LIBRARY)
         await self._conn.execute(SCHEMA_ALGORITHM_PERFORMANCE)
+        await self._conn.execute(SCHEMA_SCHEDULES)
+        await self._conn.execute(SCHEMA_EXECUTION_HISTORY)
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -403,3 +437,132 @@ class StorageManager:
             pd.DataFrame().to_csv(output_path, index=False)
         else:
             pd.DataFrame(events).to_csv(output_path, index=False)
+
+    async def save_schedule(self, schedule_dict: dict) -> None:
+        await self._conn.execute(
+            """INSERT INTO schedules
+               (id, name, interval, cron_expression, metrics, algorithms,
+                ensemble_mode, weights, status, last_run_time,
+                last_anomaly_count, last_alert_triggered, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                schedule_dict["id"],
+                schedule_dict.get("name", "Untitled"),
+                schedule_dict.get("interval", "5m"),
+                schedule_dict.get("cron_expression"),
+                schedule_dict.get("metrics", "[]"),
+                schedule_dict.get("algorithms", '["three_sigma","iqr"]'),
+                schedule_dict.get("ensemble_mode", "majority"),
+                schedule_dict.get("weights", "{}"),
+                schedule_dict.get("status", "running"),
+                schedule_dict.get("last_run_time"),
+                schedule_dict.get("last_anomaly_count", 0),
+                schedule_dict.get("last_alert_triggered", 0),
+                schedule_dict.get("created_at", datetime.utcnow().isoformat()),
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_all_schedules(self) -> list[dict]:
+        cursor = await self._conn.execute(
+            "SELECT id, name, interval, cron_expression, metrics, algorithms, "
+            "ensemble_mode, weights, status, last_run_time, "
+            "last_anomaly_count, last_alert_triggered, created_at "
+            "FROM schedules ORDER BY created_at"
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": r[0], "name": r[1], "interval": r[2],
+                "cron_expression": r[3], "metrics": r[4], "algorithms": r[5],
+                "ensemble_mode": r[6], "weights": r[7], "status": r[8],
+                "last_run_time": r[9], "last_anomaly_count": r[10],
+                "last_alert_triggered": r[11], "created_at": r[12],
+            }
+            for r in rows
+        ]
+
+    async def delete_schedule(self, schedule_id: str) -> None:
+        await self._conn.execute(
+            "DELETE FROM execution_history WHERE schedule_id = ?",
+            (schedule_id,),
+        )
+        await self._conn.execute(
+            "DELETE FROM schedules WHERE id = ?",
+            (schedule_id,),
+        )
+        await self._conn.commit()
+
+    async def update_schedule_status(self, schedule_id: str, status: str) -> None:
+        await self._conn.execute(
+            "UPDATE schedules SET status = ? WHERE id = ?",
+            (status, schedule_id),
+        )
+        await self._conn.commit()
+
+    async def update_schedule_last_run(
+        self,
+        schedule_id: str,
+        last_run_time: str,
+        anomaly_count: int,
+        alert_triggered: bool,
+    ) -> None:
+        await self._conn.execute(
+            "UPDATE schedules SET last_run_time = ?, last_anomaly_count = ?, "
+            "last_alert_triggered = ?, status = 'running' WHERE id = ?",
+            (last_run_time, anomaly_count, int(alert_triggered), schedule_id),
+        )
+        await self._conn.commit()
+
+    async def save_execution_history(self, history_dict: dict) -> int:
+        cursor = await self._conn.execute(
+            """INSERT INTO execution_history
+               (schedule_id, start_time, status)
+               VALUES (?, ?, ?)""",
+            (
+                history_dict["schedule_id"],
+                history_dict["start_time"],
+                history_dict.get("status", "running"),
+            ),
+        )
+        await self._conn.commit()
+        return cursor.lastrowid
+
+    async def update_execution_history(self, history_id: int, update_dict: dict) -> None:
+        sets: list[str] = []
+        params: list = []
+        for key in ("end_time", "anomaly_count", "alert_triggered", "status", "error"):
+            if key in update_dict:
+                sets.append(f"{key} = ?")
+                val = update_dict[key]
+                if key == "alert_triggered":
+                    val = int(val)
+                params.append(val)
+        if not sets:
+            return
+        params.append(history_id)
+        await self._conn.execute(
+            f"UPDATE execution_history SET {', '.join(sets)} WHERE id = ?",
+            params,
+        )
+        await self._conn.commit()
+
+    async def get_execution_history(
+        self, schedule_id: str, limit: int = 20
+    ) -> list[dict]:
+        cursor = await self._conn.execute(
+            "SELECT id, schedule_id, start_time, end_time, anomaly_count, "
+            "alert_triggered, status, error "
+            "FROM execution_history WHERE schedule_id = ? "
+            "ORDER BY start_time DESC LIMIT ?",
+            (schedule_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": r[0], "schedule_id": r[1], "start_time": r[2],
+                "end_time": r[3], "anomaly_count": r[4],
+                "alert_triggered": bool(r[5]), "status": r[6], "error": r[7],
+            }
+            for r in rows
+        ]

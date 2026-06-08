@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 
 from app.ingestion.parser import parse_csv, parse_influxdb_lp, parse_prometheus_json
 from app.labeling.loop import LabelingLoop
+from app.scheduler.engine import SchedulerEngine
 from app.storage.database import StorageManager
 
 from .models import (
@@ -26,21 +27,27 @@ from .models import (
     DetectionResult,
     LabelRequest,
     LabelType,
+    ScheduleCreateRequest,
+    ScheduleResponse,
     TaskStatus,
 )
 from .tasks import get_task, register_task, run_batch_detection, run_detection_task
 
 storage: StorageManager = StorageManager()
 _labeling_loop: Optional[LabelingLoop] = None
+_scheduler_engine: Optional[SchedulerEngine] = None
 _ws_connections: list[WebSocket] = []
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _labeling_loop
+    global _labeling_loop, _scheduler_engine
     await storage.init()
     _labeling_loop = LabelingLoop(storage)
+    _scheduler_engine = SchedulerEngine(storage, _ws_broadcast)
+    await _scheduler_engine.start()
     yield
+    await _scheduler_engine.stop()
     await storage.close()
 
 
@@ -174,3 +181,58 @@ async def import_data(request: DataImportRequest):
         metrics=metric_names,
         rows_imported=len(df),
     )
+
+
+@app.post("/api/schedules", response_model=ScheduleResponse)
+async def create_schedule(request: ScheduleCreateRequest):
+    if _scheduler_engine is None:
+        raise HTTPException(status_code=503, detail="Scheduler not initialized")
+    schedule_id = await _scheduler_engine.create_schedule(request)
+    schedule = _scheduler_engine.get_schedule(schedule_id)
+    if schedule is None:
+        raise HTTPException(status_code=500, detail="Failed to create schedule")
+    return ScheduleResponse(**schedule)
+
+
+@app.get("/api/schedules", response_model=list[ScheduleResponse])
+async def list_schedules():
+    if _scheduler_engine is None:
+        raise HTTPException(status_code=503, detail="Scheduler not initialized")
+    schedules = _scheduler_engine.list_schedules()
+    return [ScheduleResponse(**s) for s in schedules]
+
+
+@app.delete("/api/schedules/{schedule_id}")
+async def delete_schedule(schedule_id: str):
+    if _scheduler_engine is None:
+        raise HTTPException(status_code=503, detail="Scheduler not initialized")
+    success = await _scheduler_engine.delete_schedule(schedule_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    return {"status": "ok", "schedule_id": schedule_id}
+
+
+@app.put("/api/schedules/{schedule_id}/pause")
+async def pause_schedule(schedule_id: str):
+    if _scheduler_engine is None:
+        raise HTTPException(status_code=503, detail="Scheduler not initialized")
+    success = await _scheduler_engine.pause_schedule(schedule_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="Schedule not found or not running")
+    return {"status": "ok", "schedule_id": schedule_id, "state": "paused"}
+
+
+@app.put("/api/schedules/{schedule_id}/resume")
+async def resume_schedule(schedule_id: str):
+    if _scheduler_engine is None:
+        raise HTTPException(status_code=503, detail="Scheduler not initialized")
+    success = await _scheduler_engine.resume_schedule(schedule_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="Schedule not found or not paused")
+    return {"status": "ok", "schedule_id": schedule_id, "state": "running"}
+
+
+@app.get("/api/schedules/{schedule_id}/history")
+async def get_schedule_history(schedule_id: str, limit: int = 20):
+    history = await storage.get_execution_history(schedule_id, limit)
+    return history
