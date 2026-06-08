@@ -333,8 +333,11 @@ async def delete_model(model_id: str):
 async def trigger_retrain(model_id: str):
     if _retrain_engine is None:
         raise HTTPException(status_code=503, detail="Retrain engine not initialized")
-    if _retrain_engine.is_training_in_progress(model_id):
-        raise HTTPException(status_code=409, detail="Training already in progress for this model")
+    model = await _model_registry.get_model(model_id) if _model_registry else None
+    if model is None:
+        raise HTTPException(status_code=404, detail="Model not found")
+    if _retrain_engine.is_training_in_progress(model.name):
+        raise HTTPException(status_code=409, detail="Training already in progress for this algorithm")
     new_model_id = await _retrain_engine.trigger_retrain(model_id, "manual")
     if new_model_id is None:
         raise HTTPException(status_code=400, detail="Failed to trigger retraining")

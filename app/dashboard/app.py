@@ -722,11 +722,11 @@ def render_tab_model_registry() -> None:
         st.info("No models registered yet. Use the form above to register a new model.")
         return
 
-    status_colors = {
-        "training": "🔵",
-        "active": "🟢",
-        "retired": "🟡",
-        "failed": "🔴",
+    status_labels = {
+        "training": "● Training",
+        "active": "✓ Active",
+        "retired": "○ Retired",
+        "failed": "✗ Failed",
     }
 
     for model_group in models:
@@ -736,9 +736,10 @@ def render_tab_model_registry() -> None:
         active_f1 = model_group.get("active_f1", 0.0)
         active_version = model_group.get("active_version", "")
         active_id = model_group.get("active_model_id")
+        active_status = "✓ Active" if active_id else "○ Retired"
 
         with st.expander(
-            f"**{name}** — {algo} — v{active_version} — F1: {active_f1:.3f} — {version_count} version(s)",
+            f"**{name}** — {algo} — v{active_version} — {active_status} — F1: {active_f1:.3f} — {version_count} version(s)",
             expanded=False,
         ):
             versions: list[dict] = []
@@ -754,10 +755,10 @@ def render_tab_model_registry() -> None:
                 timeline_data = []
                 for v in versions:
                     v_status = v.get("status", "training")
-                    icon = status_colors.get(v_status, "⚪")
+                    status_display = status_labels.get(v_status, v_status)
                     timeline_data.append({
                         "Version": v.get("version", ""),
-                        "Status": f"{icon} {v_status}",
+                        "Status": status_display,
                         "Precision": f"{v.get('precision', 0.0):.4f}",
                         "Recall": f"{v.get('recall', 0.0):.4f}",
                         "F1": f"{v.get('f1', 0.0):.4f}",

@@ -34,6 +34,7 @@ class RetrainEngine:
         self._running = False
         self._check_task: Optional[asyncio.Task] = None
         self._training_locks: set[str] = set()
+        self._training_lock_by_name: dict[str, str] = {}
 
     async def start(self) -> None:
         if self._running:
@@ -95,7 +96,7 @@ class RetrainEngine:
             return False
         if model.status != ModelStatus.ACTIVE:
             return False
-        if model.id in self._training_locks:
+        if config.model_name in self._training_lock_by_name:
             return False
 
         if config.trigger_type == TriggerType.SCHEDULED:
@@ -170,16 +171,17 @@ class RetrainEngine:
     async def trigger_retrain(
         self, model_id: str, trigger_reason: str = "manual"
     ) -> Optional[str]:
-        if model_id in self._training_locks:
-            logger.info("Training already in progress for %s, skipping", model_id)
-            return None
-
         model = await self._registry.get_model(model_id)
         if model is None:
             logger.error("Model %s not found for retraining", model_id)
             return None
 
+        if model.name in self._training_lock_by_name:
+            logger.info("Training already in progress for algorithm %s, skipping", model.name)
+            return None
+
         self._training_locks.add(model_id)
+        self._training_lock_by_name[model.name] = model_id
 
         try:
             retrain_config = await self._storage.get_retrain_config(model.name)
@@ -255,7 +257,7 @@ class RetrainEngine:
                         new_model.id, context.new_f1, context.old_f1,
                     )
 
-                await self._storage.save_training_context(context.model_dump())
+            await self._storage.save_training_context(context.model_dump())
 
             if self._ws_callback:
                 try:
@@ -280,6 +282,7 @@ class RetrainEngine:
             return None
         finally:
             self._training_locks.discard(model_id)
+            self._training_lock_by_name.pop(model.name, None)
 
     async def save_retrain_config(self, config: RetrainStrategyConfig) -> None:
         await self._storage.save_retrain_config({
@@ -308,5 +311,5 @@ class RetrainEngine:
             enabled=cfg.get("enabled", True),
         )
 
-    def is_training_in_progress(self, model_id: str) -> bool:
-        return model_id in self._training_locks
+    def is_training_in_progress(self, model_name: str) -> bool:
+        return model_name in self._training_lock_by_name
