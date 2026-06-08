@@ -1,0 +1,13 @@
+services:
+  anomaly-detect:
+    build: .
+    ports:
+      - "8000:8000"
+      - "8501:8501"
+    volumes:
+      - anomaly-data:/app/data
+      - anomaly-db:/app/anomaly_detect.db
+
+volumes:
+  anomaly-data:
+  anomaly-db:
