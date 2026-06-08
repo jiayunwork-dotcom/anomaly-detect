@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import threading
 from datetime import datetime, timedelta
@@ -655,6 +656,462 @@ def render_tab_scheduled_tasks() -> None:
                 st.warning(f"History load error: {e}")
 
 
+def render_tab_model_registry() -> None:
+    import httpx
+
+    API_BASE = "http://localhost:8000"
+
+    st.header("Model Registry")
+
+    col_reg1, col_reg2 = st.columns([3, 1])
+    with col_reg2:
+        with st.expander("Register New Model", expanded=False):
+            new_name = st.text_input("Model Name", value="", key="mr_new_name")
+            new_algo = st.selectbox(
+                "Algorithm Type",
+                list(ALGORITHM_REGISTRY.keys()),
+                key="mr_new_algo",
+            )
+            new_params_str = st.text_area(
+                "Training Params (JSON)",
+                value="{}",
+                key="mr_new_params",
+                height=80,
+            )
+            if st.button("Register & Train", key="mr_register_btn"):
+                if not new_name.strip():
+                    st.warning("Model name is required.")
+                else:
+                    try:
+                        params = json.loads(new_params_str) if new_params_str.strip() else {}
+                    except Exception:
+                        st.error("Invalid JSON for training params.")
+                        params = {}
+                    try:
+                        now = datetime.utcnow()
+                        resp = httpx.post(
+                            f"{API_BASE}/api/models",
+                            json={
+                                "name": new_name.strip(),
+                                "algorithm_type": new_algo,
+                                "training_params": params,
+                                "training_data_start": (now - timedelta(days=30)).isoformat(),
+                                "training_data_end": now.isoformat(),
+                            },
+                            timeout=15.0,
+                        )
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            st.success(f"Model registered: {data.get('id', '')} (v{data.get('version', '')})")
+                            st.rerun()
+                        else:
+                            st.error(f"Failed: {resp.text}")
+                    except Exception as e:
+                        st.error(f"API error: {e}")
+
+    models: list[dict] = []
+    try:
+        resp = httpx.get(f"{API_BASE}/api/models", timeout=10.0)
+        if resp.status_code == 200:
+            models = resp.json()
+    except Exception as e:
+        st.error(f"Failed to load models: {e}")
+        return
+
+    if not models:
+        st.info("No models registered yet. Use the form above to register a new model.")
+        return
+
+    status_colors = {
+        "training": "🔵",
+        "active": "🟢",
+        "retired": "🟡",
+        "failed": "🔴",
+    }
+
+    for model_group in models:
+        name = model_group.get("name", "")
+        algo = model_group.get("algorithm_type", "")
+        version_count = model_group.get("version_count", 0)
+        active_f1 = model_group.get("active_f1", 0.0)
+        active_version = model_group.get("active_version", "")
+        active_id = model_group.get("active_model_id")
+
+        with st.expander(
+            f"**{name}** — {algo} — v{active_version} — F1: {active_f1:.3f} — {version_count} version(s)",
+            expanded=False,
+        ):
+            versions: list[dict] = []
+            try:
+                vresp = httpx.get(f"{API_BASE}/api/models/{name}/versions", timeout=10.0)
+                if vresp.status_code == 200:
+                    versions = vresp.json()
+            except Exception:
+                st.warning("Failed to load versions.")
+
+            if versions:
+                st.subheader("Version Timeline")
+                timeline_data = []
+                for v in versions:
+                    v_status = v.get("status", "training")
+                    icon = status_colors.get(v_status, "⚪")
+                    timeline_data.append({
+                        "Version": v.get("version", ""),
+                        "Status": f"{icon} {v_status}",
+                        "Precision": f"{v.get('precision', 0.0):.4f}",
+                        "Recall": f"{v.get('recall', 0.0):.4f}",
+                        "F1": f"{v.get('f1', 0.0):.4f}",
+                        "Created": v.get("created_at", "")[:19],
+                        "ID": v.get("id", ""),
+                    })
+                st.dataframe(
+                    pd.DataFrame(timeline_data),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            if active_id:
+                st.subheader("Retraining Configuration")
+                retrain_config: Optional[dict] = None
+                try:
+                    rcresp = httpx.get(
+                        f"{API_BASE}/api/models/{active_id}/retrain-config",
+                        timeout=10.0,
+                    )
+                    if rcresp.status_code == 200:
+                        retrain_config = rcresp.json()
+                except Exception:
+                    pass
+
+                rc_trigger = st.selectbox(
+                    "Trigger Type",
+                    ["scheduled", "performance", "data_drift"],
+                    index=["scheduled", "performance", "data_drift"].index(
+                        retrain_config.get("trigger_type", "scheduled") if retrain_config else "scheduled"
+                    ),
+                    key=f"mr_trigger_{active_id}",
+                )
+                rc_col1, rc_col2 = st.columns(2)
+                with rc_col1:
+                    if rc_trigger == "scheduled":
+                        rc_interval = st.number_input(
+                            "Interval (hours)",
+                            min_value=1,
+                            max_value=720,
+                            value=retrain_config.get("scheduled_interval_hours", 24) if retrain_config else 24,
+                            key=f"mr_interval_{active_id}",
+                        )
+                    else:
+                        rc_interval = 24
+
+                    if rc_trigger == "performance":
+                        rc_window = st.number_input(
+                            "Window Size (detection windows)",
+                            min_value=1,
+                            max_value=100,
+                            value=retrain_config.get("performance_window_size", 10) if retrain_config else 10,
+                            key=f"mr_perf_window_{active_id}",
+                        )
+                        rc_f1_thresh = st.number_input(
+                            "F1 Threshold",
+                            min_value=0.0,
+                            max_value=1.0,
+                            value=retrain_config.get("performance_f1_threshold", 0.7) if retrain_config else 0.7,
+                            step=0.05,
+                            key=f"mr_f1_thresh_{active_id}",
+                        )
+                    else:
+                        rc_window = 10
+                        rc_f1_thresh = 0.7
+
+                with rc_col2:
+                    if rc_trigger == "data_drift":
+                        rc_kl_thresh = st.number_input(
+                            "KL Divergence Threshold",
+                            min_value=0.01,
+                            max_value=10.0,
+                            value=retrain_config.get("drift_kl_threshold", 0.5) if retrain_config else 0.5,
+                            step=0.05,
+                            key=f"mr_kl_thresh_{active_id}",
+                        )
+                    else:
+                        rc_kl_thresh = 0.5
+
+                    rc_data_days = st.number_input(
+                        "Training Data (days)",
+                        min_value=1,
+                        max_value=365,
+                        value=retrain_config.get("training_data_days", 30) if retrain_config else 30,
+                        key=f"mr_data_days_{active_id}",
+                    )
+
+                rc_enabled = st.checkbox(
+                    "Enabled",
+                    value=retrain_config.get("enabled", True) if retrain_config else True,
+                    key=f"mr_enabled_{active_id}",
+                )
+
+                if st.button("Save Retrain Config", key=f"mr_save_config_{active_id}"):
+                    try:
+                        save_resp = httpx.post(
+                            f"{API_BASE}/api/models/retrain-config",
+                            json={
+                                "model_id": active_id,
+                                "trigger_type": rc_trigger,
+                                "scheduled_interval_hours": rc_interval,
+                                "performance_window_size": rc_window,
+                                "performance_f1_threshold": rc_f1_thresh,
+                                "drift_kl_threshold": rc_kl_thresh,
+                                "training_data_days": rc_data_days,
+                                "enabled": rc_enabled,
+                            },
+                            timeout=10.0,
+                        )
+                        if save_resp.status_code == 200:
+                            st.success("Retrain config saved.")
+                        else:
+                            st.error(f"Failed: {save_resp.text}")
+                    except Exception as e:
+                        st.error(f"API error: {e}")
+
+                st.subheader("Actions")
+                action_col1, action_col2, action_col3 = st.columns(3)
+                with action_col1:
+                    if st.button("Trigger Retrain", key=f"mr_retrain_{active_id}"):
+                        try:
+                            tr_resp = httpx.post(
+                                f"{API_BASE}/api/models/{active_id}/retrain",
+                                timeout=15.0,
+                            )
+                            if tr_resp.status_code == 200:
+                                st.success(f"Retraining triggered: {tr_resp.json().get('new_model_id', '')}")
+                                st.rerun()
+                            else:
+                                st.error(f"Failed: {tr_resp.text}")
+                        except Exception as e:
+                            st.error(f"API error: {e}")
+
+                with action_col2:
+                    if st.button("Retire", key=f"mr_retire_{active_id}"):
+                        try:
+                            ret_resp = httpx.put(
+                                f"{API_BASE}/api/models/{active_id}/retire",
+                                timeout=10.0,
+                            )
+                            if ret_resp.status_code == 200:
+                                st.success("Model retired.")
+                                st.rerun()
+                            else:
+                                st.error(f"Failed: {ret_resp.text}")
+                        except Exception as e:
+                            st.error(f"API error: {e}")
+
+                with action_col3:
+                    pass
+
+            for v in versions:
+                v_id = v.get("id", "")
+                v_status = v.get("status", "")
+                if v_status == "retired":
+                    if st.button(f"Delete v{v.get('version', '')}", key=f"mr_del_{v_id}"):
+                        try:
+                            del_resp = httpx.delete(
+                                f"{API_BASE}/api/models/{v_id}",
+                                timeout=10.0,
+                            )
+                            if del_resp.status_code == 200:
+                                st.success("Deleted.")
+                                st.rerun()
+                            else:
+                                st.error(f"Failed: {del_resp.text}")
+                        except Exception as e:
+                            st.error(f"API error: {e}")
+                    break
+
+            st.subheader("Training Progress")
+            for v in versions:
+                v_id = v.get("id", "")
+                v_status = v.get("status", "")
+                try:
+                    prog_resp = httpx.get(
+                        f"{API_BASE}/api/models/{v_id}/progress",
+                        timeout=10.0,
+                    )
+                    if prog_resp.status_code == 200:
+                        prog = prog_resp.json()
+                        stage = prog.get("stage", "idle")
+                        if stage not in ("idle", "completed", "failed"):
+                            current = prog.get("current_step", 0)
+                            total = prog.get("total_steps", 4)
+                            desc = prog.get("stage_description", stage)
+                            st.progress(current / total if total > 0 else 0)
+                            st.caption(f"v{v.get('version', '')} — {desc} ({current}/{total})")
+                        elif stage == "failed":
+                            st.error(f"v{v.get('version', '')} — Training failed: {prog.get('error_message', 'Unknown')}")
+                except Exception:
+                    pass
+
+            st.subheader("Training History")
+            try:
+                for v in versions:
+                    v_id = v.get("id", "")
+                    hist_resp = httpx.get(
+                        f"{API_BASE}/api/models/{v_id}/training-history",
+                        timeout=10.0,
+                    )
+                    if hist_resp.status_code == 200:
+                        histories = hist_resp.json()
+                        if histories:
+                            for h in histories:
+                                h_col1, h_col2 = st.columns([3, 2])
+                                with h_col1:
+                                    st.markdown(
+                                        f"**v{v.get('version', '')}** — "
+                                        f"Data: {h.get('training_data_count', 0)} pts — "
+                                        f"Duration: {h.get('training_duration_seconds', 0):.1f}s"
+                                    )
+                                    if h.get("error"):
+                                        st.error(f"Error: {h['error'][:200]}")
+                                with h_col2:
+                                    if h.get("new_f1", 0) > 0:
+                                        st.markdown(
+                                            f"Old P/R/F1: {h.get('old_precision', 0):.3f} / "
+                                            f"{h.get('old_recall', 0):.3f} / {h.get('old_f1', 0):.3f}"
+                                        )
+                                        st.markdown(
+                                            f"New P/R/F1: {h.get('new_precision', 0):.3f} / "
+                                            f"{h.get('new_recall', 0):.3f} / {h.get('new_f1', 0):.3f}"
+                                        )
+                                        if h.get("auto_activated"):
+                                            st.success("Auto-activated ✓")
+                                        else:
+                                            st.warning("Not activated")
+            except Exception as e:
+                st.warning(f"History load error: {e}")
+
+    st.header("Model Version Comparison")
+    all_versions: list[dict] = []
+    try:
+        for mg in models:
+            vresp = httpx.get(f"{API_BASE}/api/models/{mg['name']}/versions", timeout=10.0)
+            if vresp.status_code == 200:
+                all_versions.extend(vresp.json())
+    except Exception:
+        pass
+
+    if len(all_versions) < 2:
+        st.info("Need at least 2 model versions to compare.")
+    else:
+        version_labels = [
+            f"{v.get('name', '')} v{v.get('version', '')} ({v.get('status', '')}) — {v.get('id', '')}"
+            for v in all_versions
+        ]
+        version_ids = [v.get("id", "") for v in all_versions]
+
+        cmp_col1, cmp_col2 = st.columns(2)
+        with cmp_col1:
+            sel_a = st.selectbox("Model A", range(len(version_labels)), format_func=lambda i: version_labels[i], key="mr_cmp_a")
+        with cmp_col2:
+            sel_b = st.selectbox("Model B", range(len(version_labels)), format_func=lambda i: version_labels[i], key="mr_cmp_b")
+
+        if st.button("Compare", key="mr_compare_btn"):
+            if sel_a == sel_b:
+                st.warning("Please select two different models.")
+            else:
+                model_a_id = version_ids[sel_a]
+                model_b_id = version_ids[sel_b]
+                try:
+                    cmp_resp = httpx.post(
+                        f"{API_BASE}/api/models/compare",
+                        json={"model_a_id": model_a_id, "model_b_id": model_b_id},
+                        timeout=30.0,
+                    )
+                    if cmp_resp.status_code == 200:
+                        cmp_data = cmp_resp.json()
+                        scores_a = cmp_data.get("model_a_scores", [])
+                        scores_b = cmp_data.get("model_b_scores", [])
+
+                        if not scores_a or not scores_b:
+                            st.info("No score data available for comparison.")
+                        else:
+                            min_len = min(len(scores_a), len(scores_b))
+                            x_vals = list(range(min_len))
+
+                            st.subheader("Anomaly Score Distribution")
+                            score_fig = go.Figure()
+                            sample_step = max(1, min_len // 500)
+                            sample_x = x_vals[::sample_step]
+                            sample_a = scores_a[:min_len:sample_step]
+                            sample_b = scores_b[:min_len:sample_step]
+
+                            score_fig.add_trace(
+                                go.Scatter(
+                                    x=sample_x,
+                                    y=sample_a,
+                                    mode="lines",
+                                    name=f"v{cmp_data.get('model_a_version', 'A')}",
+                                    line=dict(color="#636efa"),
+                                )
+                            )
+                            score_fig.add_trace(
+                                go.Scatter(
+                                    x=sample_x,
+                                    y=sample_b,
+                                    mode="lines",
+                                    name=f"v{cmp_data.get('model_b_version', 'B')}",
+                                    line=dict(color="#ef553b"),
+                                )
+                            )
+                            score_fig.update_layout(
+                                title="Anomaly Score Comparison",
+                                xaxis_title="Sample Index",
+                                yaxis_title="Score",
+                                height=400,
+                            )
+                            st.plotly_chart(score_fig, use_container_width=True)
+
+                            st.subheader("Metrics Comparison")
+                            metrics_fig = go.Figure()
+                            categories = ["Precision", "Recall", "F1"]
+                            vals_a = [
+                                cmp_data.get("model_a_precision", 0),
+                                cmp_data.get("model_a_recall", 0),
+                                cmp_data.get("model_a_f1", 0),
+                            ]
+                            vals_b = [
+                                cmp_data.get("model_b_precision", 0),
+                                cmp_data.get("model_b_recall", 0),
+                                cmp_data.get("model_b_f1", 0),
+                            ]
+                            metrics_fig.add_trace(
+                                go.Bar(
+                                    name=f"v{cmp_data.get('model_a_version', 'A')}",
+                                    x=categories,
+                                    y=vals_a,
+                                    marker_color="#636efa",
+                                )
+                            )
+                            metrics_fig.add_trace(
+                                go.Bar(
+                                    name=f"v{cmp_data.get('model_b_version', 'B')}",
+                                    x=categories,
+                                    y=vals_b,
+                                    marker_color="#ef553b",
+                                )
+                            )
+                            metrics_fig.update_layout(
+                                title="Precision / Recall / F1 Comparison",
+                                yaxis_title="Score",
+                                barmode="group",
+                                height=400,
+                            )
+                            st.plotly_chart(metrics_fig, use_container_width=True)
+                    else:
+                        st.error(f"Comparison failed: {cmp_resp.text}")
+                except Exception as e:
+                    st.error(f"API error: {e}")
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Anomaly Detection Dashboard",
@@ -679,9 +1136,9 @@ def main() -> None:
                 ensemble_mode, weights,
             )
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         ["Time Series", "Anomaly Events", "Root Cause Analysis",
-         "Algorithm Performance", "Data Import", "Scheduled Tasks"]
+         "Algorithm Performance", "Data Import", "Scheduled Tasks", "Model Registry"]
     )
 
     with tab1:
@@ -701,6 +1158,9 @@ def main() -> None:
 
     with tab6:
         render_tab_scheduled_tasks()
+
+    with tab7:
+        render_tab_model_registry()
 
 
 if __name__ == "__main__":

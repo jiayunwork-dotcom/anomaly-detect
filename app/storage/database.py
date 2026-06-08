@@ -163,6 +163,70 @@ CREATE TABLE IF NOT EXISTS execution_history (
 )
 """
 
+SCHEMA_MODEL_VERSIONS = """
+CREATE TABLE IF NOT EXISTS model_versions (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    algorithm_type TEXT NOT NULL,
+    version TEXT NOT NULL,
+    training_params TEXT DEFAULT '{}',
+    training_data_start TEXT DEFAULT '',
+    training_data_end TEXT DEFAULT '',
+    precision REAL DEFAULT 0.0,
+    recall REAL DEFAULT 0.0,
+    f1 REAL DEFAULT 0.0,
+    status TEXT DEFAULT 'training',
+    parent_version_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+SCHEMA_RETRAIN_CONFIGS = """
+CREATE TABLE IF NOT EXISTS retrain_configs (
+    model_id TEXT PRIMARY KEY,
+    trigger_type TEXT DEFAULT 'scheduled',
+    scheduled_interval_hours INTEGER DEFAULT 24,
+    performance_window_size INTEGER DEFAULT 10,
+    performance_f1_threshold REAL DEFAULT 0.7,
+    drift_kl_threshold REAL DEFAULT 0.5,
+    training_data_days INTEGER DEFAULT 30,
+    enabled INTEGER DEFAULT 1,
+    FOREIGN KEY (model_id) REFERENCES model_versions(id)
+)
+"""
+
+SCHEMA_TRAINING_CONTEXTS = """
+CREATE TABLE IF NOT EXISTS training_contexts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_id TEXT NOT NULL,
+    training_data_count INTEGER DEFAULT 0,
+    training_duration_seconds REAL DEFAULT 0.0,
+    stages TEXT DEFAULT '[]',
+    old_precision REAL DEFAULT 0.0,
+    old_recall REAL DEFAULT 0.0,
+    old_f1 REAL DEFAULT 0.0,
+    new_precision REAL DEFAULT 0.0,
+    new_recall REAL DEFAULT 0.0,
+    new_f1 REAL DEFAULT 0.0,
+    auto_activated INTEGER DEFAULT 0,
+    error TEXT,
+    completed_at TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (model_id) REFERENCES model_versions(id)
+)
+"""
+
+SCHEMA_MODEL_F1_HISTORY = """
+CREATE TABLE IF NOT EXISTS model_f1_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_id TEXT NOT NULL,
+    f1_score REAL NOT NULL,
+    recorded_at TEXT NOT NULL,
+    FOREIGN KEY (model_id) REFERENCES model_versions(id)
+)
+"""
+
 
 class StorageManager:
     def __init__(self, db_path: str = "metadata.db", data_dir: str = "data") -> None:
@@ -181,6 +245,10 @@ class StorageManager:
         await self._conn.execute(SCHEMA_ALGORITHM_PERFORMANCE)
         await self._conn.execute(SCHEMA_SCHEDULES)
         await self._conn.execute(SCHEMA_EXECUTION_HISTORY)
+        await self._conn.execute(SCHEMA_MODEL_VERSIONS)
+        await self._conn.execute(SCHEMA_RETRAIN_CONFIGS)
+        await self._conn.execute(SCHEMA_TRAINING_CONTEXTS)
+        await self._conn.execute(SCHEMA_MODEL_F1_HISTORY)
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -566,3 +634,296 @@ class StorageManager:
             }
             for r in rows
         ]
+
+    async def save_model_version(self, model_dict: dict) -> None:
+        await self._conn.execute(
+            """INSERT INTO model_versions
+               (id, name, algorithm_type, version, training_params, training_data_start,
+                training_data_end, precision, recall, f1, status, parent_version_id,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                model_dict["id"],
+                model_dict["name"],
+                model_dict["algorithm_type"],
+                model_dict["version"],
+                model_dict.get("training_params", "{}"),
+                model_dict.get("training_data_start", ""),
+                model_dict.get("training_data_end", ""),
+                model_dict.get("precision", 0.0),
+                model_dict.get("recall", 0.0),
+                model_dict.get("f1", 0.0),
+                model_dict.get("status", "training"),
+                model_dict.get("parent_version_id"),
+                model_dict.get("created_at", datetime.utcnow().isoformat()),
+                model_dict.get("updated_at", datetime.utcnow().isoformat()),
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_model_version(self, model_id: str) -> Optional[dict]:
+        cursor = await self._conn.execute(
+            "SELECT id, name, algorithm_type, version, training_params, training_data_start, "
+            "training_data_end, precision, recall, f1, status, parent_version_id, "
+            "created_at, updated_at FROM model_versions WHERE id = ?",
+            (model_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0], "name": row[1], "algorithm_type": row[2],
+            "version": row[3], "training_params": row[4],
+            "training_data_start": row[5], "training_data_end": row[6],
+            "precision": row[7], "recall": row[8], "f1": row[9],
+            "status": row[10], "parent_version_id": row[11],
+            "created_at": row[12], "updated_at": row[13],
+        }
+
+    async def list_model_versions(self, name: str) -> list[dict]:
+        cursor = await self._conn.execute(
+            "SELECT id, name, algorithm_type, version, training_params, training_data_start, "
+            "training_data_end, precision, recall, f1, status, parent_version_id, "
+            "created_at, updated_at FROM model_versions WHERE name = ? ORDER BY created_at DESC",
+            (name,),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": r[0], "name": r[1], "algorithm_type": r[2],
+                "version": r[3], "training_params": r[4],
+                "training_data_start": r[5], "training_data_end": r[6],
+                "precision": r[7], "recall": r[8], "f1": r[9],
+                "status": r[10], "parent_version_id": r[11],
+                "created_at": r[12], "updated_at": r[13],
+            }
+            for r in rows
+        ]
+
+    async def list_model_groups(self) -> list[dict]:
+        cursor = await self._conn.execute(
+            "SELECT name, COUNT(*) as version_count, "
+            "MAX(created_at) as latest_created, "
+            "GROUP_CONCAT(CASE WHEN status = 'active' THEN id END) as active_model_id "
+            "FROM model_versions GROUP BY name ORDER BY latest_created DESC"
+        )
+        rows = await cursor.fetchall()
+        result = []
+        for r in rows:
+            active_id = r[3]
+            if active_id and "," in active_id:
+                active_id = active_id.split(",")[0]
+            algo_cursor = await self._conn.execute(
+                "SELECT algorithm_type, f1, version FROM model_versions WHERE name = ? AND status = 'active' LIMIT 1",
+                (r[0],),
+            )
+            algo_row = await algo_cursor.fetchone()
+            result.append({
+                "name": r[0],
+                "version_count": r[1],
+                "latest_created": r[2],
+                "active_model_id": active_id,
+                "algorithm_type": algo_row[0] if algo_row else "",
+                "active_f1": algo_row[1] if algo_row else 0.0,
+                "active_version": algo_row[2] if algo_row else "",
+            })
+        return result
+
+    async def get_active_model_version(self, name: str) -> Optional[dict]:
+        cursor = await self._conn.execute(
+            "SELECT id, name, algorithm_type, version, training_params, training_data_start, "
+            "training_data_end, precision, recall, f1, status, parent_version_id, "
+            "created_at, updated_at FROM model_versions WHERE name = ? AND status = 'active' LIMIT 1",
+            (name,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0], "name": row[1], "algorithm_type": row[2],
+            "version": row[3], "training_params": row[4],
+            "training_data_start": row[5], "training_data_end": row[6],
+            "precision": row[7], "recall": row[8], "f1": row[9],
+            "status": row[10], "parent_version_id": row[11],
+            "created_at": row[12], "updated_at": row[13],
+        }
+
+    async def update_model_version_status(self, model_id: str, status: str) -> None:
+        now = datetime.utcnow().isoformat()
+        await self._conn.execute(
+            "UPDATE model_versions SET status = ?, updated_at = ? WHERE id = ?",
+            (status, now, model_id),
+        )
+        await self._conn.commit()
+
+    async def update_model_version_metrics(
+        self, model_id: str, precision: float, recall: float, f1: float, updated_at: str
+    ) -> None:
+        await self._conn.execute(
+            "UPDATE model_versions SET precision = ?, recall = ?, f1 = ?, updated_at = ? WHERE id = ?",
+            (precision, recall, f1, updated_at, model_id),
+        )
+        await self._conn.commit()
+
+    async def update_model_parent(self, model_id: str, parent_id: str) -> None:
+        await self._conn.execute(
+            "UPDATE model_versions SET parent_version_id = ? WHERE id = ?",
+            (parent_id, model_id),
+        )
+        await self._conn.commit()
+
+    async def delete_model_version(self, model_id: str) -> None:
+        await self._conn.execute(
+            "DELETE FROM retrain_configs WHERE model_id = ?",
+            (model_id,),
+        )
+        await self._conn.execute(
+            "DELETE FROM model_f1_history WHERE model_id = ?",
+            (model_id,),
+        )
+        await self._conn.execute(
+            "DELETE FROM training_contexts WHERE model_id = ?",
+            (model_id,),
+        )
+        await self._conn.execute(
+            "DELETE FROM model_versions WHERE id = ?",
+            (model_id,),
+        )
+        await self._conn.commit()
+
+    async def save_retrain_config(self, config_dict: dict) -> None:
+        await self._conn.execute(
+            """INSERT OR REPLACE INTO retrain_configs
+               (model_id, trigger_type, scheduled_interval_hours, performance_window_size,
+                performance_f1_threshold, drift_kl_threshold, training_data_days, enabled)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                config_dict["model_id"],
+                config_dict.get("trigger_type", "scheduled"),
+                config_dict.get("scheduled_interval_hours", 24),
+                config_dict.get("performance_window_size", 10),
+                config_dict.get("performance_f1_threshold", 0.7),
+                config_dict.get("drift_kl_threshold", 0.5),
+                config_dict.get("training_data_days", 30),
+                int(config_dict.get("enabled", True)),
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_retrain_config(self, model_id: str) -> Optional[dict]:
+        cursor = await self._conn.execute(
+            "SELECT model_id, trigger_type, scheduled_interval_hours, performance_window_size, "
+            "performance_f1_threshold, drift_kl_threshold, training_data_days, enabled "
+            "FROM retrain_configs WHERE model_id = ?",
+            (model_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "model_id": row[0], "trigger_type": row[1],
+            "scheduled_interval_hours": row[2],
+            "performance_window_size": row[3],
+            "performance_f1_threshold": row[4],
+            "drift_kl_threshold": row[5],
+            "training_data_days": row[6],
+            "enabled": bool(row[7]),
+        }
+
+    async def list_retrain_configs(self) -> list[dict]:
+        cursor = await self._conn.execute(
+            "SELECT model_id, trigger_type, scheduled_interval_hours, performance_window_size, "
+            "performance_f1_threshold, drift_kl_threshold, training_data_days, enabled "
+            "FROM retrain_configs"
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "model_id": r[0], "trigger_type": r[1],
+                "scheduled_interval_hours": r[2],
+                "performance_window_size": r[3],
+                "performance_f1_threshold": r[4],
+                "drift_kl_threshold": r[5],
+                "training_data_days": r[6],
+                "enabled": bool(r[7]),
+            }
+            for r in rows
+        ]
+
+    async def save_training_context(self, ctx_dict: dict) -> int:
+        import json as _json
+        cursor = await self._conn.execute(
+            """INSERT INTO training_contexts
+               (model_id, training_data_count, training_duration_seconds, stages,
+                old_precision, old_recall, old_f1, new_precision, new_recall, new_f1,
+                auto_activated, error, completed_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                ctx_dict["model_id"],
+                ctx_dict.get("training_data_count", 0),
+                ctx_dict.get("training_duration_seconds", 0.0),
+                _json.dumps(ctx_dict.get("stages", [])),
+                ctx_dict.get("old_precision", 0.0),
+                ctx_dict.get("old_recall", 0.0),
+                ctx_dict.get("old_f1", 0.0),
+                ctx_dict.get("new_precision", 0.0),
+                ctx_dict.get("new_recall", 0.0),
+                ctx_dict.get("new_f1", 0.0),
+                int(ctx_dict.get("auto_activated", False)),
+                ctx_dict.get("error"),
+                ctx_dict.get("completed_at", ""),
+                datetime.utcnow().isoformat(),
+            ),
+        )
+        await self._conn.commit()
+        return cursor.lastrowid
+
+    async def get_training_contexts(self, model_id: str, limit: int = 20) -> list[dict]:
+        import json as _json
+        cursor = await self._conn.execute(
+            "SELECT id, model_id, training_data_count, training_duration_seconds, stages, "
+            "old_precision, old_recall, old_f1, new_precision, new_recall, new_f1, "
+            "auto_activated, error, completed_at, created_at "
+            "FROM training_contexts WHERE model_id = ? ORDER BY created_at DESC LIMIT ?",
+            (model_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": r[0], "model_id": r[1],
+                "training_data_count": r[2],
+                "training_duration_seconds": r[3],
+                "stages": _json.loads(r[4]) if r[4] else [],
+                "old_precision": r[5], "old_recall": r[6], "old_f1": r[7],
+                "new_precision": r[8], "new_recall": r[9], "new_f1": r[10],
+                "auto_activated": bool(r[11]),
+                "error": r[12], "completed_at": r[13], "created_at": r[14],
+            }
+            for r in rows
+        ]
+
+    async def save_f1_score(self, model_id: str, f1_score: float) -> None:
+        now = datetime.utcnow().isoformat()
+        await self._conn.execute(
+            "INSERT INTO model_f1_history (model_id, f1_score, recorded_at) VALUES (?, ?, ?)",
+            (model_id, f1_score, now),
+        )
+        await self._conn.commit()
+
+    async def get_recent_f1_scores(self, model_id: str, limit: int = 10) -> list[float]:
+        cursor = await self._conn.execute(
+            "SELECT f1_score FROM model_f1_history WHERE model_id = ? ORDER BY recorded_at DESC LIMIT ?",
+            (model_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows]
+
+    async def get_last_training_time(self, model_id: str) -> Optional[str]:
+        cursor = await self._conn.execute(
+            "SELECT completed_at FROM training_contexts WHERE model_id = ? AND error IS NULL ORDER BY completed_at DESC LIMIT 1",
+            (model_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None or not row[0]:
+            return None
+        return row[0]
