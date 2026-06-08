@@ -664,6 +664,9 @@ def render_tab_model_registry() -> None:
 
     st.header("Model Registry")
 
+    if "pending_dismiss_alerts" not in st.session_state:
+        st.session_state.pending_dismiss_alerts = []
+
     try:
         alerts_resp = httpx.get(f"{API_BASE}/api/models/alerts", params={"dismissed": "false"}, timeout=10.0)
         if alerts_resp.status_code == 200:
@@ -672,6 +675,22 @@ def render_tab_model_registry() -> None:
             active_alerts = []
     except Exception:
         active_alerts = []
+
+    if st.session_state.pending_dismiss_alerts:
+        for dismiss_id in st.session_state.pending_dismiss_alerts:
+            try:
+                httpx.put(f"{API_BASE}/api/models/alerts/{dismiss_id}/dismiss", timeout=10.0)
+            except Exception:
+                pass
+        st.session_state.pending_dismiss_alerts = []
+        try:
+            alerts_resp = httpx.get(f"{API_BASE}/api/models/alerts", params={"dismissed": "false"}, timeout=10.0)
+            if alerts_resp.status_code == 200:
+                active_alerts = alerts_resp.json()
+            else:
+                active_alerts = []
+        except Exception:
+            active_alerts = []
 
     if active_alerts:
         st.markdown("#### ⚠️ Model Performance Degradation Alerts")
@@ -688,13 +707,8 @@ def render_tab_model_registry() -> None:
                 )
             with alert_cols[1]:
                 if st.button("Dismiss", key=f"dismiss_alert_{alert_id}"):
-                    try:
-                        dr = httpx.put(f"{API_BASE}/api/models/alerts/{alert_id}/dismiss", timeout=10.0)
-                        if dr.status_code == 200:
-                            st.success("Alert dismissed")
-                            st.rerun()
-                    except Exception as e:
-                        st.error(f"Failed: {e}")
+                    st.session_state.pending_dismiss_alerts.append(alert_id)
+                    st.rerun()
 
     col_reg1, col_reg2 = st.columns([3, 1])
     with col_reg2:
@@ -1192,7 +1206,10 @@ def render_tab_model_registry() -> None:
                         if not scores_a or not scores_b:
                             st.info("No score data available for comparison.")
                         else:
-                            if sample_size < 50:
+                            sample_size_a = cmp_data.get("sample_size_a", len(scores_a))
+                            sample_size_b = cmp_data.get("sample_size_b", len(scores_b))
+                            min_sample = min(sample_size_a, sample_size_b)
+                            if min_sample < 50:
                                 st.warning("⚠️ Sample size insufficient (<50), statistical test results may be unreliable.")
 
                             st.subheader("Kolmogorov-Smirnov Test Report")
@@ -1215,16 +1232,18 @@ def render_tab_model_registry() -> None:
 
                             st.subheader("Distribution Statistics Comparison")
                             stats_data = {
-                                "Statistic": ["Mean", "Std Dev", "Median"],
+                                "Statistic": ["Mean", "Std Dev", "Median", "Sample Size"],
                                 ver_a: [
                                     f"{cmp_data.get('model_a_mean', 0):.4f}",
                                     f"{cmp_data.get('model_a_std', 0):.4f}",
                                     f"{cmp_data.get('model_a_median', 0):.4f}",
+                                    str(sample_size_a),
                                 ],
                                 ver_b: [
                                     f"{cmp_data.get('model_b_mean', 0):.4f}",
                                     f"{cmp_data.get('model_b_std', 0):.4f}",
                                     f"{cmp_data.get('model_b_median', 0):.4f}",
+                                    str(sample_size_b),
                                 ],
                             }
                             st.dataframe(pd.DataFrame(stats_data), use_container_width=True, hide_index=True)
@@ -1246,7 +1265,7 @@ def render_tab_model_registry() -> None:
                                             x=x_grid,
                                             y=kde_a(x_grid),
                                             mode="lines",
-                                            name=ver_a,
+                                            name=f"{ver_a} (n={sample_size_a})",
                                             line=dict(color="#636efa", width=2),
                                             fill="tozeroy",
                                             opacity=0.3,
@@ -1257,7 +1276,7 @@ def render_tab_model_registry() -> None:
                                             x=x_grid,
                                             y=kde_b(x_grid),
                                             mode="lines",
-                                            name=ver_b,
+                                            name=f"{ver_b} (n={sample_size_b})",
                                             line=dict(color="#ef553b", width=2),
                                             fill="tozeroy",
                                             opacity=0.3,
@@ -1281,18 +1300,18 @@ def render_tab_model_registry() -> None:
                                 st.info("Score range is zero, cannot compute KDE.")
 
                             st.subheader("Anomaly Score Time Series")
-                            min_len = min(len(scores_a), len(scores_b))
-                            x_vals = list(range(min_len))
                             score_fig = go.Figure()
-                            sample_step = max(1, min_len // 500)
-                            sample_x = x_vals[::sample_step]
-                            sample_a = scores_a[:min_len:sample_step]
-                            sample_b = scores_b[:min_len:sample_step]
+                            step_a = max(1, len(scores_a) // 500)
+                            step_b = max(1, len(scores_b) // 500)
+                            idx_a = list(range(0, len(scores_a), step_a))
+                            idx_b = list(range(0, len(scores_b), step_b))
+                            sampled_a = [scores_a[i] for i in idx_a]
+                            sampled_b = [scores_b[i] for i in idx_b]
 
                             score_fig.add_trace(
                                 go.Scatter(
-                                    x=sample_x,
-                                    y=sample_a,
+                                    x=idx_a,
+                                    y=sampled_a,
                                     mode="lines",
                                     name=ver_a,
                                     line=dict(color="#636efa"),
@@ -1300,8 +1319,8 @@ def render_tab_model_registry() -> None:
                             )
                             score_fig.add_trace(
                                 go.Scatter(
-                                    x=sample_x,
-                                    y=sample_b,
+                                    x=idx_b,
+                                    y=sampled_b,
                                     mode="lines",
                                     name=ver_b,
                                     line=dict(color="#ef553b"),

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import pandas as pd
@@ -26,7 +26,7 @@ DETECTOR_MAP: dict[str, type] = {
     "iqr": IQRFecutor,
     "stl": STLDetector,
     "isolation_forest": IsolationForestDetector,
-    "lstm_autoencoder": LSTMEncoderDetector,
+    "lstm_autoencoder": ProphetDetector,
     "prophet": ProphetDetector,
 }
 
@@ -119,6 +119,7 @@ async def run_detection_task(
     request: DetectionRequest,
     storage: StorageManager,
     ws_callback: Any = None,
+    model_registry: Any = None,
 ) -> None:
     state = _tasks.get(task_id)
     if state is None:
@@ -133,6 +134,20 @@ async def run_detection_task(
 
         all_anomalies: list[AnomalyItem] = []
         anomaly_metrics: list[str] = []
+
+        ab_routing_decisions: dict[str, str] = {}
+        if model_registry is not None:
+            from app.model_registry.models import ABTestStatus
+
+            for algo_name in (request.algorithms or list(DETECTOR_MAP.keys())):
+                try:
+                    routed_model_id = await model_registry.route_ab_test(algo_name)
+                    if routed_model_id is not None:
+                        ab_test = await model_registry.get_ab_test(algo_name)
+                        if ab_test is not None and ab_test.status == ABTestStatus.RUNNING:
+                            ab_routing_decisions[algo_name] = routed_model_id
+                except Exception:
+                    pass
 
         for shard_df, shard_meta in shards_list:
             for meta in shard_meta:
@@ -243,6 +258,68 @@ async def run_detection_task(
                 except Exception:
                     pass
 
+        if model_registry is not None and ab_routing_decisions:
+            from app.model_registry.models import ABTestStatus
+
+            for algo_name, routed_model_id in ab_routing_decisions.items():
+                try:
+                    ab_test = await model_registry.get_ab_test(algo_name)
+                    if ab_test is None or ab_test.status != ABTestStatus.RUNNING:
+                        continue
+
+                    tp = fp = fn = tn = 0
+                    algo_items = [a for a in all_anomalies if a.algorithm == algo_name]
+                    algo_anomalous = [a for a in algo_items if a.is_anomaly]
+
+                    labeled_events = await storage.get_anomaly_events(
+                        datetime.utcnow() - timedelta(hours=1),
+                        datetime.utcnow(),
+                    )
+                    ground_truth_timestamps = set()
+                    for evt in labeled_events:
+                        if evt.get("algorithm") == algo_name and evt.get("label") == "tp":
+                            ground_truth_timestamps.add(evt.get("start_time", ""))
+
+                    detected_timestamps = set(a.timestamp for a in algo_anomalous)
+
+                    tp = len(detected_timestamps & ground_truth_timestamps)
+                    fp = len(detected_timestamps - ground_truth_timestamps)
+                    fn = len(ground_truth_timestamps - detected_timestamps)
+
+                    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+                    is_primary = routed_model_id == ab_test.primary_model_id
+
+                    if is_primary:
+                        cur_primary_p = precision
+                        cur_primary_r = recall
+                        cur_primary_f1 = f1
+                        cur_challenger_p = ab_test.challenger_precision
+                        cur_challenger_r = ab_test.challenger_recall
+                        cur_challenger_f1 = ab_test.challenger_f1
+                    else:
+                        cur_primary_p = ab_test.primary_precision
+                        cur_primary_r = ab_test.primary_recall
+                        cur_primary_f1 = ab_test.primary_f1
+                        cur_challenger_p = precision
+                        cur_challenger_r = recall
+                        cur_challenger_f1 = f1
+
+                    await model_registry.record_ab_test_window(
+                        model_name=algo_name,
+                        primary_precision=cur_primary_p,
+                        primary_recall=cur_primary_r,
+                        primary_f1=cur_primary_f1,
+                        challenger_precision=cur_challenger_p,
+                        challenger_recall=cur_challenger_r,
+                        challenger_f1=cur_challenger_f1,
+                        ws_callback=ws_callback,
+                    )
+                except Exception:
+                    pass
+
         result = DetectionResult(
             task_id=task_id,
             status=TaskStatus.COMPLETED,
@@ -267,9 +344,10 @@ async def run_batch_detection(
     requests: list[DetectionRequest],
     storage: StorageManager,
     ws_callback: Any = None,
+    model_registry: Any = None,
 ) -> None:
     tasks = [
-        run_detection_task(tid, req, storage, ws_callback)
+        run_detection_task(tid, req, storage, ws_callback, model_registry)
         for tid, req in zip(task_ids, requests)
     ]
     await asyncio.gather(*tasks)

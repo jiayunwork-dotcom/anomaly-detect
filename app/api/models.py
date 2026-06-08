@@ -218,6 +218,8 @@ class ModelCompareResponse(BaseModel):
     model_b_mean: float = 0.0
     model_b_std: float = 0.0
     model_b_median: float = 0.0
+    sample_size_a: int = 0
+    sample_size_b: int = 0
     sample_size: int = 0
 
 

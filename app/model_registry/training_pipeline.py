@@ -257,17 +257,14 @@ class TrainingPipeline:
         if min_len == 0:
             return None
 
-        scores_a = scores_a[:min_len]
-        scores_b = scores_b[:min_len]
-
-        arr_a = np.array(scores_a)
-        arr_b = np.array(scores_b)
+        full_arr_a = np.array(scores_a)
+        full_arr_b = np.array(scores_b)
 
         ks_statistic = 0.0
         ks_pvalue = 1.0
         ks_reject_null = False
-        if min_len >= 2:
-            ks_statistic, ks_pvalue = ks_2samp(arr_a, arr_b)
+        if len(full_arr_a) >= 2 and len(full_arr_b) >= 2:
+            ks_statistic, ks_pvalue = ks_2samp(full_arr_a, full_arr_b)
             ks_reject_null = ks_pvalue < 0.05
 
         return {
@@ -286,12 +283,14 @@ class TrainingPipeline:
             "ks_statistic": float(ks_statistic),
             "ks_pvalue": float(ks_pvalue),
             "ks_reject_null": ks_reject_null,
-            "model_a_mean": float(np.mean(arr_a)),
-            "model_a_std": float(np.std(arr_a)),
-            "model_a_median": float(np.median(arr_a)),
-            "model_b_mean": float(np.mean(arr_b)),
-            "model_b_std": float(np.std(arr_b)),
-            "model_b_median": float(np.median(arr_b)),
+            "model_a_mean": float(np.mean(full_arr_a)),
+            "model_a_std": float(np.std(full_arr_a)),
+            "model_a_median": float(np.median(full_arr_a)),
+            "model_b_mean": float(np.mean(full_arr_b)),
+            "model_b_std": float(np.std(full_arr_b)),
+            "model_b_median": float(np.median(full_arr_b)),
+            "sample_size_a": len(scores_a),
+            "sample_size_b": len(scores_b),
             "sample_size": min_len,
         }
 

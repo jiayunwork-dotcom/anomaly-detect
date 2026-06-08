@@ -92,7 +92,7 @@ async def _ws_broadcast(data: dict) -> None:
 async def submit_detection(request: DetectionRequest):
     task_id = uuid4().hex
     register_task(task_id)
-    asyncio.create_task(run_detection_task(task_id, request, storage, _ws_broadcast))
+    asyncio.create_task(run_detection_task(task_id, request, storage, _ws_broadcast, _model_registry))
     return DetectionResponse(task_id=task_id, status=TaskStatus.PENDING)
 
 
@@ -112,7 +112,7 @@ async def submit_batch_detection(request: BatchDetectionRequest):
     for tid in task_ids:
         register_task(tid)
     asyncio.create_task(
-        run_batch_detection(task_ids, request.items, storage, _ws_broadcast)
+        run_batch_detection(task_ids, request.items, storage, _ws_broadcast, _model_registry)
     )
     return BatchDetectionResponse(task_ids=task_ids)
 
