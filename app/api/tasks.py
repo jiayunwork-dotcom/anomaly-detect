@@ -8,13 +8,7 @@ from typing import Any, Optional
 
 import pandas as pd
 
-from app.detection.base import AnomalyType
-from app.detection.ensemble import EnsembleDetector, merge_granularity_results
-from app.detection.granularity import (
-    CollectiveAnomalyDetector,
-    ContextualAnomalyDetector,
-    PointAnomalyDetector,
-)
+from app.detection.ensemble import EnsembleDetector
 from app.detection.ml import IsolationForestDetector, LSTMEncoderDetector, ProphetDetector
 from app.detection.statistical import IQRFecutor, STLDetector, ThreeSigmaDetector
 from app.ingestion.parser import (
@@ -104,8 +98,6 @@ def _run_detection_for_metric(
         results = ensemble.detect(series, {"ensemble_mode": request.ensemble_mode.value, **merged_config})
     else:
         results = detectors[0].detect(series, merged_config)
-
-    point_results = PointAnomalyDetector(detectors[0] if len(detectors) == 1 else EnsembleDetector(detectors, request.weights)).detect(series, merged_config) if not any(r.anomaly_type != AnomalyType.POINT for r in results) else results
 
     items: list[AnomalyItem] = []
     for r in results:

@@ -49,10 +49,10 @@ class _LSTMAutoencoder(nn.Module):
         self.decoder = nn.LSTM(hidden_dim, input_dim, num_layers, batch_first=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _, (h, c) = self.encoder(x)
+        _, (h, _) = self.encoder(x)
         seq_len = x.size(1)
         decoder_input = h[-1].unsqueeze(1).repeat(1, seq_len, 1)
-        output, _ = self.decoder(decoder_input, (h, c))
+        output, _ = self.decoder(decoder_input)
         return output
 
 

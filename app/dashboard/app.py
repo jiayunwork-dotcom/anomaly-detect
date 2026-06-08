@@ -16,14 +16,14 @@ from streamlit_agraph import agraph
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.analysis.root_cause import CausalGraph, run_root_cause_analysis
-from app.detection.base import AnomalyResult, AnomalyType
+from app.detection.base import AnomalyResult, AnomalyType, BaseDetector
 from app.detection.ensemble import EnsembleDetector
 from app.detection.granularity import (
     CollectiveAnomalyDetector,
     ContextualAnomalyDetector,
     PointAnomalyDetector,
 )
-from app.detection.ml import IsolationForestDetector
+from app.detection.ml import IsolationForestDetector, LSTMEncoderDetector, ProphetDetector
 from app.detection.statistical import IQRFecutor, STLDetector, ThreeSigmaDetector
 from app.ingestion.parser import parse_csv, parse_influxdb_lp, parse_prometheus_json
 from app.labeling.loop import LabelingLoop
@@ -82,16 +82,50 @@ def get_time_range(
     return ranges.get(preset, ranges["Last 1h"])
 
 
+ALGORITHM_REGISTRY: dict[str, type[BaseDetector]] = {
+    "three_sigma": ThreeSigmaDetector,
+    "iqr": IQRFecutor,
+    "stl": STLDetector,
+    "isolation_forest": IsolationForestDetector,
+    "lstm_autoencoder": LSTMEncoderDetector,
+    "prophet": ProphetDetector,
+}
+
+GRANULARITY_REGISTRY: dict[str, str] = {
+    "point": "Point Anomaly",
+    "contextual": "Contextual Anomaly",
+    "collective": "Collective Anomaly",
+}
+
+
 def run_detection(
     metrics_data: pd.DataFrame,
     selected_metrics: list[str],
+    selected_algorithms: list[str],
+    selected_granularities: list[str],
+    ensemble_mode: str,
+    weights: dict[str, float],
 ) -> list[AnomalyResult]:
-    detectors = [
-        PointAnomalyDetector(ThreeSigmaDetector()),
-        ContextualAnomalyDetector(),
-        CollectiveAnomalyDetector(),
-    ]
-    ensemble = EnsembleDetector(detectors)
+    base_detectors: list[BaseDetector] = []
+    for algo_name in selected_algorithms:
+        cls = ALGORITHM_REGISTRY.get(algo_name)
+        if cls is not None:
+            base_detectors.append(cls())
+
+    detectors: list[BaseDetector] = []
+    for g in selected_granularities:
+        if g == "point":
+            for d in base_detectors:
+                detectors.append(PointAnomalyDetector(d))
+        elif g == "contextual":
+            detectors.append(ContextualAnomalyDetector())
+        elif g == "collective":
+            detectors.append(CollectiveAnomalyDetector())
+
+    if not detectors:
+        detectors = [PointAnomalyDetector(ThreeSigmaDetector())]
+
+    ensemble = EnsembleDetector(detectors, weights=weights if ensemble_mode == "weighted" else None)
     all_results: list[AnomalyResult] = []
     for metric in selected_metrics:
         if metric not in metrics_data.columns:
@@ -99,7 +133,7 @@ def run_detection(
         series = metrics_data[metric].dropna()
         if len(series) < 3:
             continue
-        results = ensemble.detect(series, {"ensemble_mode": "majority"})
+        results = ensemble.detect(series, {"ensemble_mode": ensemble_mode})
         all_results.extend(results)
     return all_results
 
@@ -129,7 +163,7 @@ def load_metrics_data(
     return combined
 
 
-def render_sidebar() -> tuple[list[str], datetime, datetime]:
+def render_sidebar() -> tuple[list[str], datetime, datetime, list[str], list[str], str, dict[str, float]]:
     with st.sidebar:
         st.header("Filters")
         time_preset = st.selectbox(
@@ -163,11 +197,39 @@ def render_sidebar() -> tuple[list[str], datetime, datetime]:
 
         selected_metrics = st.multiselect("Select Metrics", filtered)
 
+        st.header("Detection Config")
+        selected_algorithms = st.multiselect(
+            "Algorithms",
+            list(ALGORITHM_REGISTRY.keys()),
+            default=["three_sigma", "iqr"],
+        )
+        selected_granularities = st.multiselect(
+            "Granularity",
+            list(GRANULARITY_REGISTRY.keys()),
+            default=["point", "contextual", "collective"],
+            format_func=lambda x: GRANULARITY_REGISTRY[x],
+        )
+        ensemble_mode = st.radio("Voting Mode", ["majority", "weighted"], horizontal=True)
+
+        weights: dict[str, float] = {}
+        if ensemble_mode == "weighted":
+            st.subheader("Algorithm Weights")
+            for algo_name in selected_algorithms:
+                w = st.slider(
+                    algo_name,
+                    min_value=0.0,
+                    max_value=2.0,
+                    value=1.0,
+                    step=0.1,
+                    key=f"weight_{algo_name}",
+                )
+                weights[algo_name] = w
+
         st.header("Data Import")
         st.file_uploader("Upload File", type=["csv", "json", "txt"], key="sidebar_upload")
         st.selectbox("Format", ["CSV", "Prometheus JSON", "InfluxDB LP"], key="sidebar_format")
 
-    return selected_metrics, start_time, end_time
+    return selected_metrics, start_time, end_time, selected_algorithms, selected_granularities, ensemble_mode, weights
 
 
 def render_tab_timeseries(
@@ -391,7 +453,7 @@ def main() -> None:
     storage = init_storage()
     labeling_loop = LabelingLoop(storage)
 
-    selected_metrics, start_time, end_time = render_sidebar()
+    selected_metrics, start_time, end_time, selected_algorithms, selected_granularities, ensemble_mode, weights = render_sidebar()
 
     metrics_data: pd.DataFrame = pd.DataFrame()
     anomalies: list[AnomalyResult] = []
@@ -399,7 +461,11 @@ def main() -> None:
     if selected_metrics:
         metrics_data = load_metrics_data(storage, selected_metrics, start_time, end_time)
         if not metrics_data.empty:
-            anomalies = run_detection(metrics_data, selected_metrics)
+            anomalies = run_detection(
+                metrics_data, selected_metrics,
+                selected_algorithms, selected_granularities,
+                ensemble_mode, weights,
+            )
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
         ["Time Series", "Anomaly Events", "Root Cause Analysis",
