@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from datetime import datetime, timedelta
 from typing import Optional
 from uuid import uuid4
 
 from app.storage.database import StorageManager
 
-from .models import ModelStatus, ModelVersionInfo
+from .models import ABTestConfig, ABTestStatus, ModelStatus, ModelVersionInfo
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,7 @@ class ModelRegistry:
     def __init__(self, storage: StorageManager) -> None:
         self._storage = storage
         self._active_cache: dict[str, str] = {}
+        self._ab_test_cache: dict[str, ABTestConfig] = {}
 
     async def register_model(
         self,
@@ -88,6 +90,12 @@ class ModelRegistry:
         if model.status not in (ModelStatus.TRAINING, ModelStatus.RETIRED):
             return None
 
+        ab_test = await self.get_ab_test(model.name)
+        if ab_test is not None and ab_test.status == ABTestStatus.RUNNING:
+            if model_id in (ab_test.primary_model_id, ab_test.challenger_model_id):
+                logger.warning("Cannot activate model %s during A/B test for %s", model_id, model.name)
+                return None
+
         current_active = await self._storage.get_active_model_version(model.name)
         if current_active:
             await self._storage.update_model_version_status(
@@ -108,6 +116,13 @@ class ModelRegistry:
             return None
         if model.status != ModelStatus.ACTIVE:
             return None
+
+        ab_test = await self.get_ab_test(model.name)
+        if ab_test is not None and ab_test.status == ABTestStatus.RUNNING:
+            if model_id in (ab_test.primary_model_id, ab_test.challenger_model_id):
+                logger.warning("Cannot retire model %s during A/B test for %s", model_id, model.name)
+                return None
+
         await self._storage.update_model_version_status(
             model_id, ModelStatus.RETIRED.value
         )
@@ -186,3 +201,216 @@ class ModelRegistry:
             created_at=row.get("created_at", ""),
             updated_at=row.get("updated_at", ""),
         )
+
+    async def start_ab_test(
+        self,
+        model_name: str,
+        primary_model_id: str,
+        challenger_model_id: str,
+        primary_traffic_pct: float = 80.0,
+        min_windows: int = 5,
+        f1_improvement_threshold: float = 0.05,
+    ) -> Optional[ABTestConfig]:
+        existing = await self.get_ab_test(model_name)
+        if existing is not None and existing.status == ABTestStatus.RUNNING:
+            logger.warning("A/B test already running for %s", model_name)
+            return None
+
+        primary = await self.get_model(primary_model_id)
+        challenger = await self.get_model(challenger_model_id)
+        if primary is None or challenger is None:
+            logger.error("Primary or challenger model not found")
+            return None
+        if primary.name != model_name or challenger.name != model_name:
+            logger.error("Model name mismatch for A/B test")
+            return None
+
+        now = datetime.utcnow().isoformat()
+        config = ABTestConfig(
+            model_name=model_name,
+            primary_model_id=primary_model_id,
+            challenger_model_id=challenger_model_id,
+            primary_traffic_pct=primary_traffic_pct,
+            min_windows=min_windows,
+            f1_improvement_threshold=f1_improvement_threshold,
+            status=ABTestStatus.RUNNING,
+            windows_completed=0,
+            primary_precision=primary.precision,
+            primary_recall=primary.recall,
+            primary_f1=primary.f1,
+            challenger_precision=challenger.precision,
+            challenger_recall=challenger.recall,
+            challenger_f1=challenger.f1,
+            created_at=now,
+            updated_at=now,
+        )
+
+        await self._storage.save_ab_test(config.model_dump())
+        self._ab_test_cache[model_name] = config
+        logger.info("Started A/B test for %s: primary=%s challenger=%s", model_name, primary_model_id, challenger_model_id)
+        return config
+
+    async def get_ab_test(self, model_name: str) -> Optional[ABTestConfig]:
+        if model_name in self._ab_test_cache:
+            cached = self._ab_test_cache[model_name]
+            if cached.status == ABTestStatus.RUNNING:
+                return cached
+
+        row = await self._storage.get_ab_test(model_name)
+        if row is None:
+            return None
+        config = ABTestConfig(
+            model_name=row["model_name"],
+            primary_model_id=row["primary_model_id"],
+            challenger_model_id=row["challenger_model_id"],
+            primary_traffic_pct=row["primary_traffic_pct"],
+            min_windows=row["min_windows"],
+            f1_improvement_threshold=row["f1_improvement_threshold"],
+            status=ABTestStatus(row["status"]),
+            windows_completed=row["windows_completed"],
+            primary_precision=row["primary_precision"],
+            primary_recall=row["primary_recall"],
+            primary_f1=row["primary_f1"],
+            challenger_precision=row["challenger_precision"],
+            challenger_recall=row["challenger_recall"],
+            challenger_f1=row["challenger_f1"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            ended_at=row["ended_at"],
+        )
+        self._ab_test_cache[model_name] = config
+        return config
+
+    async def list_ab_tests(self) -> list[ABTestConfig]:
+        rows = await self._storage.list_ab_tests()
+        results = []
+        for row in rows:
+            config = ABTestConfig(
+                model_name=row["model_name"],
+                primary_model_id=row["primary_model_id"],
+                challenger_model_id=row["challenger_model_id"],
+                primary_traffic_pct=row["primary_traffic_pct"],
+                min_windows=row["min_windows"],
+                f1_improvement_threshold=row["f1_improvement_threshold"],
+                status=ABTestStatus(row["status"]),
+                windows_completed=row["windows_completed"],
+                primary_precision=row["primary_precision"],
+                primary_recall=row["primary_recall"],
+                primary_f1=row["primary_f1"],
+                challenger_precision=row["challenger_precision"],
+                challenger_recall=row["challenger_recall"],
+                challenger_f1=row["challenger_f1"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                ended_at=row["ended_at"],
+            )
+            results.append(config)
+        return results
+
+    async def route_ab_test(self, model_name: str) -> Optional[str]:
+        ab_test = await self.get_ab_test(model_name)
+        if ab_test is None or ab_test.status != ABTestStatus.RUNNING:
+            active = await self.get_active_model(model_name)
+            return active.id if active else None
+
+        roll = random.random() * 100
+        if roll < ab_test.primary_traffic_pct:
+            return ab_test.primary_model_id
+        else:
+            return ab_test.challenger_model_id
+
+    async def record_ab_test_window(
+        self,
+        model_name: str,
+        primary_precision: float,
+        primary_recall: float,
+        primary_f1: float,
+        challenger_precision: float,
+        challenger_recall: float,
+        challenger_f1: float,
+        ws_callback=None,
+    ) -> Optional[ABTestConfig]:
+        ab_test = await self.get_ab_test(model_name)
+        if ab_test is None or ab_test.status != ABTestStatus.RUNNING:
+            return None
+
+        ab_test.windows_completed += 1
+        ab_test.primary_precision = primary_precision
+        ab_test.primary_recall = primary_recall
+        ab_test.primary_f1 = primary_f1
+        ab_test.challenger_precision = challenger_precision
+        ab_test.challenger_recall = challenger_recall
+        ab_test.challenger_f1 = challenger_f1
+        now = datetime.utcnow().isoformat()
+        ab_test.updated_at = now
+
+        if ab_test.windows_completed >= ab_test.min_windows:
+            f1_diff = ab_test.challenger_f1 - ab_test.primary_f1
+            if f1_diff > ab_test.f1_improvement_threshold:
+                ab_test.status = ABTestStatus.COMPLETED_PROMOTED
+                ab_test.ended_at = now
+                await self._storage.save_ab_test(ab_test.model_dump())
+                self._ab_test_cache[model_name] = ab_test
+
+                await self._storage.update_model_version_status(
+                    ab_test.primary_model_id, ModelStatus.RETIRED.value
+                )
+                self._active_cache.pop(model_name, None)
+                await self.activate_model(ab_test.challenger_model_id)
+
+                logger.info(
+                    "A/B test completed: challenger promoted for %s (f1 diff=%.4f)",
+                    model_name, f1_diff,
+                )
+
+                if ws_callback:
+                    try:
+                        await ws_callback({
+                            "type": "ab_test_completed",
+                            "model_name": model_name,
+                            "result": "challenger_promoted",
+                            "primary_f1": ab_test.primary_f1,
+                            "challenger_f1": ab_test.challenger_f1,
+                            "f1_diff": f1_diff,
+                        })
+                    except Exception:
+                        pass
+
+                return ab_test
+            else:
+                ab_test.status = ABTestStatus.COMPLETED_RETIRED
+                ab_test.ended_at = now
+                await self._storage.save_ab_test(ab_test.model_dump())
+                self._ab_test_cache[model_name] = ab_test
+
+                await self._storage.update_model_version_status(
+                    ab_test.challenger_model_id, ModelStatus.RETIRED.value
+                )
+
+                logger.info(
+                    "A/B test completed: challenger retired for %s (f1 diff=%.4f)",
+                    model_name, f1_diff,
+                )
+
+                if ws_callback:
+                    try:
+                        await ws_callback({
+                            "type": "ab_test_completed",
+                            "model_name": model_name,
+                            "result": "challenger_retired",
+                            "primary_f1": ab_test.primary_f1,
+                            "challenger_f1": ab_test.challenger_f1,
+                            "f1_diff": f1_diff,
+                        })
+                    except Exception:
+                        pass
+
+                return ab_test
+
+        await self._storage.save_ab_test(ab_test.model_dump())
+        self._ab_test_cache[model_name] = ab_test
+        return ab_test
+
+    def is_ab_test_running(self, model_name: str) -> bool:
+        ab_test = self._ab_test_cache.get(model_name)
+        return ab_test is not None and ab_test.status == ABTestStatus.RUNNING

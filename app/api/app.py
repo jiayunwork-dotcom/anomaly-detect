@@ -18,6 +18,8 @@ from app.scheduler.engine import SchedulerEngine
 from app.storage.database import StorageManager
 
 from .models import (
+    ABTestResponse,
+    ABTestStartRequest,
     AnomalyEventResponse,
     BatchDetectionRequest,
     BatchDetectionResponse,
@@ -29,6 +31,7 @@ from .models import (
     DetectionResult,
     LabelRequest,
     LabelType,
+    ModelAlertResponse,
     ModelCompareRequest,
     ModelCompareResponse,
     ModelGroupResponse,
@@ -396,3 +399,70 @@ async def compare_models(request: ModelCompareRequest):
     if result is None:
         raise HTTPException(status_code=400, detail="Comparison failed - models not found or no test data")
     return ModelCompareResponse(**result)
+
+
+@app.post("/api/models/ab-test", response_model=ABTestResponse)
+async def start_ab_test(request: ABTestStartRequest):
+    if _model_registry is None:
+        raise HTTPException(status_code=503, detail="Model registry not initialized")
+    ab_test = await _model_registry.start_ab_test(
+        model_name=request.model_name,
+        primary_model_id=request.primary_model_id,
+        challenger_model_id=request.challenger_model_id,
+        primary_traffic_pct=request.primary_traffic_pct,
+        min_windows=request.min_windows,
+        f1_improvement_threshold=request.f1_improvement_threshold,
+    )
+    if ab_test is None:
+        raise HTTPException(status_code=400, detail="Failed to start A/B test - test already running or models not found")
+    return ABTestResponse(**ab_test.model_dump())
+
+
+@app.get("/api/models/ab-tests", response_model=list[ABTestResponse])
+async def list_ab_tests():
+    if _model_registry is None:
+        raise HTTPException(status_code=503, detail="Model registry not initialized")
+    tests = await _model_registry.list_ab_tests()
+    return [ABTestResponse(**t.model_dump()) for t in tests]
+
+
+@app.get("/api/models/{model_name}/ab-test", response_model=ABTestResponse)
+async def get_ab_test(model_name: str):
+    if _model_registry is None:
+        raise HTTPException(status_code=503, detail="Model registry not initialized")
+    ab_test = await _model_registry.get_ab_test(model_name)
+    if ab_test is None:
+        raise HTTPException(status_code=404, detail="A/B test not found for this model")
+    return ABTestResponse(**ab_test.model_dump())
+
+
+@app.delete("/api/models/{model_name}/ab-test")
+async def stop_ab_test(model_name: str):
+    if _model_registry is None:
+        raise HTTPException(status_code=503, detail="Model registry not initialized")
+    ab_test = await _model_registry.get_ab_test(model_name)
+    if ab_test is None:
+        raise HTTPException(status_code=404, detail="A/B test not found")
+    if ab_test.status != "running":
+        raise HTTPException(status_code=400, detail="A/B test is not running")
+    await storage.delete_ab_test(model_name)
+    _model_registry._ab_test_cache.pop(model_name, None)
+    return {"status": "ok", "model_name": model_name}
+
+
+@app.get("/api/models/alerts", response_model=list[ModelAlertResponse])
+async def list_model_alerts(dismissed: Optional[bool] = None):
+    alerts = await storage.list_model_alerts(dismissed=dismissed)
+    return [ModelAlertResponse(**a) for a in alerts]
+
+
+@app.put("/api/models/alerts/{alert_id}/dismiss", response_model=ModelAlertResponse)
+async def dismiss_model_alert(alert_id: int):
+    success = await storage.dismiss_model_alert(alert_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Alert not found or already dismissed")
+    alerts = await storage.list_model_alerts()
+    for a in alerts:
+        if a["id"] == alert_id:
+            return ModelAlertResponse(**a)
+    raise HTTPException(status_code=404, detail="Alert not found after dismissal")

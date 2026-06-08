@@ -226,6 +226,43 @@ CREATE TABLE IF NOT EXISTS model_f1_history (
 )
 """
 
+SCHEMA_AB_TESTS = """
+CREATE TABLE IF NOT EXISTS ab_tests (
+    model_name TEXT PRIMARY KEY,
+    primary_model_id TEXT NOT NULL,
+    challenger_model_id TEXT NOT NULL,
+    primary_traffic_pct REAL DEFAULT 80.0,
+    min_windows INTEGER DEFAULT 5,
+    f1_improvement_threshold REAL DEFAULT 0.05,
+    status TEXT DEFAULT 'running',
+    windows_completed INTEGER DEFAULT 0,
+    primary_precision REAL DEFAULT 0.0,
+    primary_recall REAL DEFAULT 0.0,
+    primary_f1 REAL DEFAULT 0.0,
+    challenger_precision REAL DEFAULT 0.0,
+    challenger_recall REAL DEFAULT 0.0,
+    challenger_f1 REAL DEFAULT 0.0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    ended_at TEXT DEFAULT ''
+)
+"""
+
+SCHEMA_MODEL_ALERTS = """
+CREATE TABLE IF NOT EXISTS model_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_name TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    current_f1 REAL NOT NULL,
+    f1_threshold REAL NOT NULL,
+    consecutive_low_windows INTEGER NOT NULL,
+    suggestion TEXT NOT NULL,
+    dismissed INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    dismissed_at TEXT DEFAULT ''
+)
+"""
+
 
 class StorageManager:
     def __init__(self, db_path: str = "metadata.db", data_dir: str = "data") -> None:
@@ -248,6 +285,8 @@ class StorageManager:
         await self._conn.execute(SCHEMA_RETRAIN_CONFIGS)
         await self._conn.execute(SCHEMA_TRAINING_CONTEXTS)
         await self._conn.execute(SCHEMA_MODEL_F1_HISTORY)
+        await self._conn.execute(SCHEMA_AB_TESTS)
+        await self._conn.execute(SCHEMA_MODEL_ALERTS)
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -929,3 +968,136 @@ class StorageManager:
         if row is None or not row[0]:
             return None
         return row[0]
+
+    async def save_ab_test(self, test_dict: dict) -> None:
+        await self._conn.execute(
+            """INSERT OR REPLACE INTO ab_tests
+               (model_name, primary_model_id, challenger_model_id, primary_traffic_pct,
+                min_windows, f1_improvement_threshold, status, windows_completed,
+                primary_precision, primary_recall, primary_f1,
+                challenger_precision, challenger_recall, challenger_f1,
+                created_at, updated_at, ended_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                test_dict["model_name"],
+                test_dict["primary_model_id"],
+                test_dict["challenger_model_id"],
+                test_dict.get("primary_traffic_pct", 80.0),
+                test_dict.get("min_windows", 5),
+                test_dict.get("f1_improvement_threshold", 0.05),
+                test_dict.get("status", "running"),
+                test_dict.get("windows_completed", 0),
+                test_dict.get("primary_precision", 0.0),
+                test_dict.get("primary_recall", 0.0),
+                test_dict.get("primary_f1", 0.0),
+                test_dict.get("challenger_precision", 0.0),
+                test_dict.get("challenger_recall", 0.0),
+                test_dict.get("challenger_f1", 0.0),
+                test_dict.get("created_at", datetime.utcnow().isoformat()),
+                test_dict.get("updated_at", datetime.utcnow().isoformat()),
+                test_dict.get("ended_at", ""),
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_ab_test(self, model_name: str) -> Optional[dict]:
+        cursor = await self._conn.execute(
+            "SELECT model_name, primary_model_id, challenger_model_id, primary_traffic_pct, "
+            "min_windows, f1_improvement_threshold, status, windows_completed, "
+            "primary_precision, primary_recall, primary_f1, "
+            "challenger_precision, challenger_recall, challenger_f1, "
+            "created_at, updated_at, ended_at FROM ab_tests WHERE model_name = ?",
+            (model_name,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "model_name": row[0], "primary_model_id": row[1], "challenger_model_id": row[2],
+            "primary_traffic_pct": row[3], "min_windows": row[4], "f1_improvement_threshold": row[5],
+            "status": row[6], "windows_completed": row[7],
+            "primary_precision": row[8], "primary_recall": row[9], "primary_f1": row[10],
+            "challenger_precision": row[11], "challenger_recall": row[12], "challenger_f1": row[13],
+            "created_at": row[14], "updated_at": row[15], "ended_at": row[16],
+        }
+
+    async def list_ab_tests(self) -> list[dict]:
+        cursor = await self._conn.execute(
+            "SELECT model_name, primary_model_id, challenger_model_id, primary_traffic_pct, "
+            "min_windows, f1_improvement_threshold, status, windows_completed, "
+            "primary_precision, primary_recall, primary_f1, "
+            "challenger_precision, challenger_recall, challenger_f1, "
+            "created_at, updated_at, ended_at FROM ab_tests ORDER BY created_at DESC"
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "model_name": r[0], "primary_model_id": r[1], "challenger_model_id": r[2],
+                "primary_traffic_pct": r[3], "min_windows": r[4], "f1_improvement_threshold": r[5],
+                "status": r[6], "windows_completed": r[7],
+                "primary_precision": r[8], "primary_recall": r[9], "primary_f1": r[10],
+                "challenger_precision": r[11], "challenger_recall": r[12], "challenger_f1": r[13],
+                "created_at": r[14], "updated_at": r[15], "ended_at": r[16],
+            }
+            for r in rows
+        ]
+
+    async def delete_ab_test(self, model_name: str) -> None:
+        await self._conn.execute(
+            "DELETE FROM ab_tests WHERE model_name = ?",
+            (model_name,),
+        )
+        await self._conn.commit()
+
+    async def save_model_alert(self, alert_dict: dict) -> int:
+        cursor = await self._conn.execute(
+            """INSERT INTO model_alerts
+               (model_name, model_id, current_f1, f1_threshold,
+                consecutive_low_windows, suggestion, dismissed, created_at, dismissed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                alert_dict["model_name"],
+                alert_dict["model_id"],
+                alert_dict["current_f1"],
+                alert_dict["f1_threshold"],
+                alert_dict["consecutive_low_windows"],
+                alert_dict["suggestion"],
+                int(alert_dict.get("dismissed", False)),
+                alert_dict.get("created_at", datetime.utcnow().isoformat()),
+                alert_dict.get("dismissed_at", ""),
+            ),
+        )
+        await self._conn.commit()
+        return cursor.lastrowid
+
+    async def list_model_alerts(self, dismissed: Optional[bool] = None) -> list[dict]:
+        query = (
+            "SELECT id, model_name, model_id, current_f1, f1_threshold, "
+            "consecutive_low_windows, suggestion, dismissed, created_at, dismissed_at "
+            "FROM model_alerts"
+        )
+        params: list = []
+        if dismissed is not None:
+            query += " WHERE dismissed = ?"
+            params.append(int(dismissed))
+        query += " ORDER BY created_at DESC"
+        cursor = await self._conn.execute(query, params)
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": r[0], "model_name": r[1], "model_id": r[2],
+                "current_f1": r[3], "f1_threshold": r[4],
+                "consecutive_low_windows": r[5], "suggestion": r[6],
+                "dismissed": bool(r[7]), "created_at": r[8], "dismissed_at": r[9],
+            }
+            for r in rows
+        ]
+
+    async def dismiss_model_alert(self, alert_id: int) -> bool:
+        now = datetime.utcnow().isoformat()
+        cursor = await self._conn.execute(
+            "UPDATE model_alerts SET dismissed = 1, dismissed_at = ? WHERE id = ? AND dismissed = 0",
+            (now, alert_id),
+        )
+        await self._conn.commit()
+        return cursor.rowcount > 0

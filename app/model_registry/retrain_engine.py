@@ -12,7 +12,7 @@ from scipy.stats import entropy
 
 from app.storage.database import StorageManager
 
-from .models import ModelStatus, RetrainStrategyConfig, TriggerType
+from .models import ABTestStatus, ModelStatus, RetrainStrategyConfig, TriggerType
 from .registry import ModelRegistry
 from .training_pipeline import TrainingPipeline
 
@@ -61,6 +61,10 @@ class RetrainEngine:
                 await self._check_all_strategies()
             except Exception as e:
                 logger.error("Periodic retrain check failed: %s", e)
+            try:
+                await self.check_performance_degradation_alerts()
+            except Exception as e:
+                logger.error("Degradation alert check failed: %s", e)
             await asyncio.sleep(60)
 
     async def _check_all_strategies(self) -> None:
@@ -97,6 +101,10 @@ class RetrainEngine:
         if model.status != ModelStatus.ACTIVE:
             return False
         if config.model_name in self._training_lock_by_name:
+            return False
+
+        ab_test = await self._registry.get_ab_test(config.model_name)
+        if ab_test is not None and ab_test.status == ABTestStatus.RUNNING:
             return False
 
         if config.trigger_type == TriggerType.SCHEDULED:
@@ -178,6 +186,11 @@ class RetrainEngine:
 
         if model.name in self._training_lock_by_name:
             logger.info("Training already in progress for algorithm %s, skipping", model.name)
+            return None
+
+        ab_test = await self._registry.get_ab_test(model.name)
+        if ab_test is not None and ab_test.status == ABTestStatus.RUNNING:
+            logger.warning("Cannot retrain model %s during A/B test for %s", model_id, model.name)
             return None
 
         self._training_locks.add(model_id)
@@ -313,3 +326,78 @@ class RetrainEngine:
 
     def is_training_in_progress(self, model_name: str) -> bool:
         return model_name in self._training_lock_by_name
+
+    async def check_performance_degradation_alerts(self) -> list[dict]:
+        configs = await self._storage.list_retrain_configs()
+        new_alerts: list[dict] = []
+
+        for cfg_dict in configs:
+            if not cfg_dict.get("enabled", True):
+                continue
+            model_name = cfg_dict["model_name"]
+            trigger_type = cfg_dict.get("trigger_type", "scheduled")
+
+            if trigger_type not in (TriggerType.PERFORMANCE.value, TriggerType.DATA_DRIFT.value):
+                continue
+
+            active_model = await self._registry.get_active_model(model_name)
+            if active_model is None:
+                continue
+
+            window_size = cfg_dict.get("performance_window_size", 10)
+            f1_threshold = cfg_dict.get("performance_f1_threshold", 0.7)
+
+            recent_f1s = await self._storage.get_recent_f1_scores(
+                active_model.id, window_size
+            )
+
+            if len(recent_f1s) < window_size:
+                continue
+
+            consecutive_low = 0
+            for f1_val in recent_f1s:
+                if f1_val < f1_threshold:
+                    consecutive_low += 1
+                else:
+                    break
+
+            if consecutive_low < 2:
+                continue
+
+            current_f1 = recent_f1s[0] if recent_f1s else 0.0
+
+            suggestion = "trigger_retrain"
+            if consecutive_low >= window_size // 2:
+                suggestion = "check_data_quality"
+
+            alert_dict = {
+                "model_name": model_name,
+                "model_id": active_model.id,
+                "current_f1": current_f1,
+                "f1_threshold": f1_threshold,
+                "consecutive_low_windows": consecutive_low,
+                "suggestion": suggestion,
+                "created_at": datetime.utcnow().isoformat(),
+            }
+
+            alert_id = await self._storage.save_model_alert(alert_dict)
+            alert_dict["id"] = alert_id
+            alert_dict["dismissed"] = False
+            new_alerts.append(alert_dict)
+
+            if self._ws_callback:
+                try:
+                    await self._ws_callback({
+                        "type": "model_degradation_alert",
+                        "alert_id": alert_id,
+                        "model_name": model_name,
+                        "model_id": active_model.id,
+                        "current_f1": current_f1,
+                        "f1_threshold": f1_threshold,
+                        "consecutive_low_windows": consecutive_low,
+                        "suggestion": suggestion,
+                    })
+                except Exception:
+                    pass
+
+        return new_alerts

@@ -658,10 +658,43 @@ def render_tab_scheduled_tasks() -> None:
 
 def render_tab_model_registry() -> None:
     import httpx
+    from scipy.stats import gaussian_kde
 
     API_BASE = "http://localhost:8000"
 
     st.header("Model Registry")
+
+    try:
+        alerts_resp = httpx.get(f"{API_BASE}/api/models/alerts", params={"dismissed": "false"}, timeout=10.0)
+        if alerts_resp.status_code == 200:
+            active_alerts = alerts_resp.json()
+        else:
+            active_alerts = []
+    except Exception:
+        active_alerts = []
+
+    if active_alerts:
+        st.markdown("#### ⚠️ Model Performance Degradation Alerts")
+        for alert in active_alerts:
+            alert_id = alert.get("id", "")
+            alert_cols = st.columns([4, 1])
+            suggestion_label = "🔄 Trigger Retrain" if alert.get("suggestion") == "trigger_retrain" else "🔍 Check Data Quality"
+            with alert_cols[0]:
+                st.warning(
+                    f"**{alert.get('model_name', '')}** — F1: {alert.get('current_f1', 0):.3f} "
+                    f"(threshold: {alert.get('f1_threshold', 0):.3f}) — "
+                    f"Consecutive low windows: {alert.get('consecutive_low_windows', 0)} — "
+                    f"Suggestion: {suggestion_label}"
+                )
+            with alert_cols[1]:
+                if st.button("Dismiss", key=f"dismiss_alert_{alert_id}"):
+                    try:
+                        dr = httpx.put(f"{API_BASE}/api/models/alerts/{alert_id}/dismiss", timeout=10.0)
+                        if dr.status_code == 200:
+                            st.success("Alert dismissed")
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed: {e}")
 
     col_reg1, col_reg2 = st.columns([3, 1])
     with col_reg2:
@@ -990,6 +1023,127 @@ def render_tab_model_registry() -> None:
             except Exception as e:
                 st.warning(f"History load error: {e}")
 
+    st.header("A/B Testing")
+    ab_tests: list[dict] = []
+    try:
+        ab_resp = httpx.get(f"{API_BASE}/api/models/ab-tests", timeout=10.0)
+        if ab_resp.status_code == 200:
+            ab_tests = ab_resp.json()
+    except Exception:
+        pass
+
+    running_tests = [t for t in ab_tests if t.get("status") == "running"]
+    completed_tests = [t for t in ab_tests if t.get("status") != "running"]
+
+    with st.expander("Start New A/B Test", expanded=False):
+        ab_model_names = [m.get("name", "") for m in models]
+        if len(ab_model_names) < 1:
+            st.info("No models available for A/B testing.")
+        else:
+            ab_model_name = st.selectbox("Model Name", ab_model_names, key="ab_model_name")
+            ab_versions: list[dict] = []
+            try:
+                ab_vresp = httpx.get(f"{API_BASE}/api/models/{ab_model_name}/versions", timeout=10.0)
+                if ab_vresp.status_code == 200:
+                    ab_versions = ab_vresp.json()
+            except Exception:
+                pass
+
+            if len(ab_versions) < 2:
+                st.info("Need at least 2 versions to start an A/B test.")
+            else:
+                ab_ver_labels = [
+                    f"v{v.get('version', '')} ({v.get('status', '')}) F1={v.get('f1', 0):.3f} — {v.get('id', '')}"
+                    for v in ab_versions
+                ]
+                ab_ver_ids = [v.get("id", "") for v in ab_versions]
+
+                ab_col1, ab_col2 = st.columns(2)
+                with ab_col1:
+                    ab_sel_primary = st.selectbox("Primary Model", range(len(ab_ver_labels)), format_func=lambda i: ab_ver_labels[i], key="ab_primary")
+                with ab_col2:
+                    ab_sel_challenger = st.selectbox("Challenger Model", range(len(ab_ver_labels)), format_func=lambda i: ab_ver_labels[i], key="ab_challenger")
+
+                ab_traffic = st.slider("Primary Traffic %", min_value=10, max_value=90, value=80, step=5, key="ab_traffic")
+                ab_min_windows = st.number_input("Min Detection Windows", min_value=1, max_value=100, value=5, key="ab_min_windows")
+                ab_f1_threshold = st.number_input("F1 Improvement Threshold", min_value=0.01, max_value=1.0, value=0.05, step=0.01, key="ab_f1_thresh")
+
+                if st.button("Start A/B Test", key="ab_start_btn"):
+                    if ab_sel_primary == ab_sel_challenger:
+                        st.warning("Select different models for primary and challenger.")
+                    else:
+                        try:
+                            ab_start_resp = httpx.post(
+                                f"{API_BASE}/api/models/ab-test",
+                                json={
+                                    "model_name": ab_model_name,
+                                    "primary_model_id": ab_ver_ids[ab_sel_primary],
+                                    "challenger_model_id": ab_ver_ids[ab_sel_challenger],
+                                    "primary_traffic_pct": float(ab_traffic),
+                                    "min_windows": ab_min_windows,
+                                    "f1_improvement_threshold": ab_f1_threshold,
+                                },
+                                timeout=15.0,
+                            )
+                            if ab_start_resp.status_code == 200:
+                                st.success("A/B test started!")
+                                st.rerun()
+                            else:
+                                st.error(f"Failed: {ab_start_resp.text}")
+                        except Exception as e:
+                            st.error(f"API error: {e}")
+
+    if running_tests:
+        st.subheader("Running A/B Tests")
+        for t in running_tests:
+            t_name = t.get("model_name", "")
+            t_status = t.get("status", "")
+            t_windows = t.get("windows_completed", 0)
+            t_min = t.get("min_windows", 5)
+            t_primary_f1 = t.get("primary_f1", 0.0)
+            t_challenger_f1 = t.get("challenger_f1", 0.0)
+            t_traffic = t.get("primary_traffic_pct", 80.0)
+
+            with st.container():
+                st.markdown(
+                    f"**{t_name}** — {t_status.upper()} — "
+                    f"Windows: {t_windows}/{t_min} — "
+                    f"Traffic: Primary {t_traffic}% / Challenger {100 - t_traffic}% — "
+                    f"Primary F1: {t_primary_f1:.3f} / Challenger F1: {t_challenger_f1:.3f}"
+                )
+                progress_pct = min(t_windows / t_min, 1.0) if t_min > 0 else 0
+                st.progress(progress_pct)
+                f1_diff = t_challenger_f1 - t_primary_f1
+                if f1_diff > 0:
+                    st.info(f"Challenger is leading by +{f1_diff:.4f} F1")
+                else:
+                    st.info(f"Primary is leading by +{-f1_diff:.4f} F1")
+
+                if st.button("Stop A/B Test", key=f"ab_stop_{t_name}"):
+                    try:
+                        stop_resp = httpx.delete(f"{API_BASE}/api/models/{t_name}/ab-test", timeout=10.0)
+                        if stop_resp.status_code == 200:
+                            st.success("A/B test stopped")
+                            st.rerun()
+                        else:
+                            st.error(f"Failed: {stop_resp.text}")
+                    except Exception as e:
+                        st.error(f"API error: {e}")
+
+    if completed_tests:
+        st.subheader("Completed A/B Tests")
+        for t in completed_tests:
+            t_name = t.get("model_name", "")
+            t_status = t.get("status", "")
+            t_primary_f1 = t.get("primary_f1", 0.0)
+            t_challenger_f1 = t.get("challenger_f1", 0.0)
+            result_icon = "✅ Challenger Promoted" if t_status == "completed_promoted" else "❌ Challenger Retired"
+            st.markdown(
+                f"**{t_name}** — {result_icon} — "
+                f"Primary F1: {t_primary_f1:.3f} / Challenger F1: {t_challenger_f1:.3f} — "
+                f"Ended: {t.get('ended_at', '')[:19]}"
+            )
+
     st.header("Model Version Comparison")
     all_versions: list[dict] = []
     try:
@@ -1031,14 +1185,104 @@ def render_tab_model_registry() -> None:
                         cmp_data = cmp_resp.json()
                         scores_a = cmp_data.get("model_a_scores", [])
                         scores_b = cmp_data.get("model_b_scores", [])
+                        sample_size = cmp_data.get("sample_size", 0)
+                        ver_a = f"v{cmp_data.get('model_a_version', 'A')}"
+                        ver_b = f"v{cmp_data.get('model_b_version', 'B')}"
 
                         if not scores_a or not scores_b:
                             st.info("No score data available for comparison.")
                         else:
+                            if sample_size < 50:
+                                st.warning("⚠️ Sample size insufficient (<50), statistical test results may be unreliable.")
+
+                            st.subheader("Kolmogorov-Smirnov Test Report")
+                            ks_stat = cmp_data.get("ks_statistic", 0.0)
+                            ks_pval = cmp_data.get("ks_pvalue", 1.0)
+                            ks_reject = cmp_data.get("ks_reject_null", False)
+
+                            ks_col1, ks_col2, ks_col3 = st.columns(3)
+                            ks_col1.metric("KS Statistic", f"{ks_stat:.4f}")
+                            ks_col2.metric("p-value", f"{ks_pval:.6f}")
+                            if ks_reject:
+                                ks_col3.metric("H₀: Same Distribution", "Rejected ✗", delta="p < 0.05")
+                            else:
+                                ks_col3.metric("H₀: Same Distribution", "Not Rejected ✓", delta="p ≥ 0.05")
+
+                            if ks_reject:
+                                st.info("The two score distributions are significantly different at the 0.05 level.")
+                            else:
+                                st.info("Cannot reject the null hypothesis that the two distributions are the same at the 0.05 level.")
+
+                            st.subheader("Distribution Statistics Comparison")
+                            stats_data = {
+                                "Statistic": ["Mean", "Std Dev", "Median"],
+                                ver_a: [
+                                    f"{cmp_data.get('model_a_mean', 0):.4f}",
+                                    f"{cmp_data.get('model_a_std', 0):.4f}",
+                                    f"{cmp_data.get('model_a_median', 0):.4f}",
+                                ],
+                                ver_b: [
+                                    f"{cmp_data.get('model_b_mean', 0):.4f}",
+                                    f"{cmp_data.get('model_b_std', 0):.4f}",
+                                    f"{cmp_data.get('model_b_median', 0):.4f}",
+                                ],
+                            }
+                            st.dataframe(pd.DataFrame(stats_data), use_container_width=True, hide_index=True)
+
+                            st.subheader("Kernel Density Estimation (Overlay)")
+                            arr_a = np.array(scores_a)
+                            arr_b = np.array(scores_b)
+                            x_min = min(arr_a.min(), arr_b.min())
+                            x_max = max(arr_a.max(), arr_b.max())
+                            x_range = x_max - x_min
+                            if x_range > 0:
+                                x_grid = np.linspace(x_min - 0.1 * x_range, x_max + 0.1 * x_range, 300)
+                                kde_fig = go.Figure()
+                                try:
+                                    kde_a = gaussian_kde(arr_a)
+                                    kde_b = gaussian_kde(arr_b)
+                                    kde_fig.add_trace(
+                                        go.Scatter(
+                                            x=x_grid,
+                                            y=kde_a(x_grid),
+                                            mode="lines",
+                                            name=ver_a,
+                                            line=dict(color="#636efa", width=2),
+                                            fill="tozeroy",
+                                            opacity=0.3,
+                                        )
+                                    )
+                                    kde_fig.add_trace(
+                                        go.Scatter(
+                                            x=x_grid,
+                                            y=kde_b(x_grid),
+                                            mode="lines",
+                                            name=ver_b,
+                                            line=dict(color="#ef553b", width=2),
+                                            fill="tozeroy",
+                                            opacity=0.3,
+                                        )
+                                    )
+                                except Exception:
+                                    kde_fig.add_trace(
+                                        go.Histogram(x=arr_a, name=ver_a, opacity=0.5, histnorm="probability density")
+                                    )
+                                    kde_fig.add_trace(
+                                        go.Histogram(x=arr_b, name=ver_b, opacity=0.5, histnorm="probability density")
+                                    )
+                                kde_fig.update_layout(
+                                    title="Anomaly Score Distribution (KDE)",
+                                    xaxis_title="Score",
+                                    yaxis_title="Density",
+                                    height=400,
+                                )
+                                st.plotly_chart(kde_fig, use_container_width=True)
+                            else:
+                                st.info("Score range is zero, cannot compute KDE.")
+
+                            st.subheader("Anomaly Score Time Series")
                             min_len = min(len(scores_a), len(scores_b))
                             x_vals = list(range(min_len))
-
-                            st.subheader("Anomaly Score Distribution")
                             score_fig = go.Figure()
                             sample_step = max(1, min_len // 500)
                             sample_x = x_vals[::sample_step]
@@ -1050,7 +1294,7 @@ def render_tab_model_registry() -> None:
                                     x=sample_x,
                                     y=sample_a,
                                     mode="lines",
-                                    name=f"v{cmp_data.get('model_a_version', 'A')}",
+                                    name=ver_a,
                                     line=dict(color="#636efa"),
                                 )
                             )
@@ -1059,7 +1303,7 @@ def render_tab_model_registry() -> None:
                                     x=sample_x,
                                     y=sample_b,
                                     mode="lines",
-                                    name=f"v{cmp_data.get('model_b_version', 'B')}",
+                                    name=ver_b,
                                     line=dict(color="#ef553b"),
                                 )
                             )
@@ -1086,7 +1330,7 @@ def render_tab_model_registry() -> None:
                             ]
                             metrics_fig.add_trace(
                                 go.Bar(
-                                    name=f"v{cmp_data.get('model_a_version', 'A')}",
+                                    name=ver_a,
                                     x=categories,
                                     y=vals_a,
                                     marker_color="#636efa",
@@ -1094,7 +1338,7 @@ def render_tab_model_registry() -> None:
                             )
                             metrics_fig.add_trace(
                                 go.Bar(
-                                    name=f"v{cmp_data.get('model_b_version', 'B')}",
+                                    name=ver_b,
                                     x=categories,
                                     y=vals_b,
                                     marker_color="#ef553b",

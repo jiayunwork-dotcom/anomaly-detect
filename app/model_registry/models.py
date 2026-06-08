@@ -74,6 +74,45 @@ class TrainingContext(BaseModel):
     completed_at: str = ""
 
 
+class ABTestStatus(str, Enum):
+    RUNNING = "running"
+    COMPLETED_PROMOTED = "completed_promoted"
+    COMPLETED_RETIRED = "completed_retired"
+
+
+class ABTestConfig(BaseModel):
+    model_name: str
+    primary_model_id: str
+    challenger_model_id: str
+    primary_traffic_pct: float = 80.0
+    min_windows: int = 5
+    f1_improvement_threshold: float = 0.05
+    status: ABTestStatus = ABTestStatus.RUNNING
+    windows_completed: int = 0
+    primary_precision: float = 0.0
+    primary_recall: float = 0.0
+    primary_f1: float = 0.0
+    challenger_precision: float = 0.0
+    challenger_recall: float = 0.0
+    challenger_f1: float = 0.0
+    created_at: str = Field(default_factory=lambda: "")
+    updated_at: str = Field(default_factory=lambda: "")
+    ended_at: str = ""
+
+
+class ModelAlert(BaseModel):
+    id: int = 0
+    model_name: str
+    model_id: str
+    current_f1: float
+    f1_threshold: float
+    consecutive_low_windows: int
+    suggestion: str
+    dismissed: bool = False
+    created_at: str = Field(default_factory=lambda: "")
+    dismissed_at: str = ""
+
+
 class ModelComparisonResult(BaseModel):
     model_a_id: str
     model_b_id: str
@@ -87,3 +126,13 @@ class ModelComparisonResult(BaseModel):
     model_b_precision: float = 0.0
     model_b_recall: float = 0.0
     model_b_f1: float = 0.0
+    ks_statistic: float = 0.0
+    ks_pvalue: float = 1.0
+    ks_reject_null: bool = False
+    model_a_mean: float = 0.0
+    model_a_std: float = 0.0
+    model_a_median: float = 0.0
+    model_b_mean: float = 0.0
+    model_b_std: float = 0.0
+    model_b_median: float = 0.0
+    sample_size: int = 0

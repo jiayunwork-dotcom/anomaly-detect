@@ -216,6 +216,7 @@ class TrainingPipeline:
     async def compare_models(
         self, model_a_id: str, model_b_id: str
     ) -> Optional[dict]:
+        from scipy.stats import ks_2samp
         from .models import ModelComparisonResult
 
         model_a = await self._registry.get_model(model_a_id)
@@ -259,6 +260,16 @@ class TrainingPipeline:
         scores_a = scores_a[:min_len]
         scores_b = scores_b[:min_len]
 
+        arr_a = np.array(scores_a)
+        arr_b = np.array(scores_b)
+
+        ks_statistic = 0.0
+        ks_pvalue = 1.0
+        ks_reject_null = False
+        if min_len >= 2:
+            ks_statistic, ks_pvalue = ks_2samp(arr_a, arr_b)
+            ks_reject_null = ks_pvalue < 0.05
+
         return {
             "model_a_id": model_a_id,
             "model_b_id": model_b_id,
@@ -272,6 +283,16 @@ class TrainingPipeline:
             "model_b_precision": model_b.precision,
             "model_b_recall": model_b.recall,
             "model_b_f1": model_b.f1,
+            "ks_statistic": float(ks_statistic),
+            "ks_pvalue": float(ks_pvalue),
+            "ks_reject_null": ks_reject_null,
+            "model_a_mean": float(np.mean(arr_a)),
+            "model_a_std": float(np.std(arr_a)),
+            "model_a_median": float(np.median(arr_a)),
+            "model_b_mean": float(np.mean(arr_b)),
+            "model_b_std": float(np.std(arr_b)),
+            "model_b_median": float(np.median(arr_b)),
+            "sample_size": min_len,
         }
 
     async def _broadcast_progress(
